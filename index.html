@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
+    <title>超軽量 BlackMIDI Player</title>
+    <style>
+        body{margin:0;background:#000;color:#fff;font-family:sans-serif;overflow:hidden;position:fixed;width:100%;height:100%;}
+        #ctl{position:absolute;top:10px;left:10px;z-index:10;display:flex;gap:10px;}
+        input[type="file"]{display:none;}
+        .btn{background:#2563eb;color:#fff;padding:8px 16px;border-radius:20px;font-size:14px;font-weight:bold;border:none;cursor:pointer;}
+        canvas{display:block;width:100vw;height:100vh;}
+        #log{position:absolute;bottom:110px;left:10px;right:10px;background:rgba(0,0,0,0.8);color:#00ff00;font-family:monospace;font-size:11px;padding:6px;max-height:50px;z-index:20;pointer-events:none;border-radius:4px;}
+    </style>
+</head>
+<body>
+    <div id="ctl">
+        <label class="btn" for="fInp">📁 MIDIを開く</label>
+        <input type="file" id="fInp" accept=".mid,.midi">
+        <button class="btn" id="pBtn" style="display:none;">▶ 再生</button>
+    </div>
+    <div id="log">ログ: BlackMIDI対応。ファイルを選択してください。</div>
+    <canvas id="cvs"></canvas>
+
+<script>
+const cvs = document.getElementById('cvs'), ctx = cvs.getContext('2d');
+const fInp = document.getElementById('fInp'), pBtn = document.getElementById('pBtn'), logDiv = document.getElementById('log');
+const MIN_NOTE = 36, MAX_NOTE = 96, NOTE_CNT = MAX_NOTE - MIN_NOTE + 1, SPEED = 250;
+let audioCtx = null, mainGain = null, isPlaying = false, startTime = 0, pauseTime = 0, notes = [], kyY = 0;
+const CLRS = ['#38bdf8', '#f43f5e', '#10b981', '#fbbf24', '#a855f7', '#ec4899', '#f97316', '#14b8a6'];
+
+// ボイスマネジメント用（同時発音制限）
+let activeVoices = [];
+const MAX_VOICES = 32; // スマホで処理落ちしない最大の同時発音数
+
+function showLog(m) { logDiv.innerText = "ログ: " + m; }
+window.onerror = (m, s, l) => { showLog("エラー: " + m + " (L:" + l + ")"); return false; };
+
+function resize() {
+    cvs.width = window.innerWidth * window.devicePixelRatio; cvs.height = window.innerHeight * window.devicePixelRatio;
+    ctx.scale(window.devicePixelRatio, window.devicePixelRatio); kyY = window.innerHeight - 100; draw(0);
+}
+window.addEventListener('resize', resize); resize();
+
+// 音響システムの初期化（音割れ防止リミッター付き）
+function initAudioEngine() {
+    if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        mainGain = audioCtx.createGain();
+        
+        // 音量自動コンプレッサー（BlackMIDIの爆音による音割れを防止）
+        const compressor = audioCtx.createDynamicsCompressor();
+        compressor.threshold.setValueAtTime(-24, audioCtx.currentTime);
+        compressor.knee.setValueAtTime(30, audioCtx.currentTime);
+        compressor.ratio.setValueAtTime(12, audioCtx.currentTime);
+        compressor.attack.setValueAtTime(0.003, audioCtx.currentTime);
+        compressor.release.setValueAtTime(0.25, audioCtx.currentTime);
+        
+        mainGain.connect(compressor);
+        compressor.connect(audioCtx.destination);
+    }
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+}
+
+function playTone(n, d, vel, ch, inst) {
+    if (!audioCtx) return;
+    const now = audioCtx.currentTime;
+    
+    // 同時発音数制限（MAXを超えたら一番古い音を強制終了してCPUを守る）
+    if (activeVoices.length >= MAX_VOICES) {
+        const oldest = activeVoices.shift();
+        try { oldest.osc.stop(now); oldest.gain.gain.setValueAtTime(0, now); } catch(e){}
+    }
+
+    // BlackMIDI用に個別ノーツの基本音量を低めにカット
+    const vol = (vel / 127) * 0.04; 
+
+    // ドラムチャンネル（10ch）の高速合成
+    if (ch === 9) {
+        const osc = audioCtx.createOscillator(), gain = audioCtx.createGain();
+        osc.type = 'triangle';
+        osc.frequency.setValueAtTime(n === 35 || n === 36 ? 120 : 6000, now);
+        if (n === 35 || n === 36) osc.frequency.exponentialRampToValueAtTime(0.01, now + 0.08);
+        gain.gain.setValueAtTime(vol * 1.5, now);
+        gain.gain.exponentialRampToValueAtTime(0.001, now + 0.05);
+        osc.connect(gain); gain.connect(mainGain);
+        osc.start(now); osc.stop(now + 0.06);
+        activeVoices.push({ osc: osc, gain: gain, time: now });
+        return;
+    }
+
+    // メロディの合成
+    const osc = audioCtx.createOscillator(), gain = audioCtx.createGain();
+    osc.frequency.setValueAtTime(440 * Math.pow(2, (n - 69) / 12), now);
+    osc.type = (inst >= 56 && inst <= 87) ? 'sawtooth' : ((inst >= 24 && inst <= 31) ? 'triangle' : 'sine');
+
+    gain.gain.setValueAtTime(vol, now);
+    // 超高密度の連打に対応するため、余韻（リリース）を極限まで短く設定
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + Math.min(d, 0.3));
+    
+    osc.connect(gain); gain.connect(mainGain);
+    osc.start(now); osc.stop(now + Math.min(d, 0.31));
+    
+    activeVoices.push({ osc: osc, gain: gain, time: now });
+}
+
+// 過去の不要になったボイス配列の掃除
+function cleanVoices() {
+    const now = audioCtx ? audioCtx.currentTime : 0;
+    activeVoices = activeVoices.filter(v => now < v.time + 0.4);
+}
+
+function readVLQ(v, o) {
+    let val = 0, idx = 0;
+    while (true) { let b = v.getUint8(o + idx); idx++; val = (val << 7) | (b & 127); if (!(b & 128)) break; }
+    return { val: val, idx: idx };
+}
+function parseMIDI(buf) {
+    const v = new DataView(buf); let off = 0;
+    if (v.getUint32(0) !== 0x4D546864) throw new Error("無効なMIDIファイルです");
+    off = 8 + v.getUint32(4); let res = [], bpm = 120, tCnt = v.getUint16(10), tDiv = v.getUint16(12);
+    
+    const skipTypes = "160_176_224"; 
+    const sysTypes = "240_247";
+    
+    for (let t = 0; t < tCnt; t++) {
+        if (off >= v.byteLength) break;
+        if (v.getUint32(off) !== 0x4D54726B) { off += 8 + v.getUint32(off + 4); continue; }
+        let tOff = off + 8, tEnd = tOff + v.getUint32(off + 4), cSec = 0, act = {}, rStat = 0, inst = 0;
+        
+        while (tOff < tEnd) {
+            let vlq = readVLQ(v, tOff); tOff += vlq.idx; cSec += vlq.val * (60 / (bpm * tDiv));
+            let stat = v.getUint8(tOff); if (stat & 128) { rStat = stat; tOff++; } else { stat = rStat; }
+            let mType = stat & 240, ch = stat & 15;
+            
+            if (mType === 144 || mType === 128) {
+                let n = v.getUint8(tOff), vel = v.getUint8(tOff + 1); tOff += 2;
+                if (mType === 144 && vel > 0) { 
+                    act[n] = { s: cSec, v: vel, i: inst, c: ch }; 
+                } else if (act[n]) {
+                    let dur = cSec - act[n].s;
+                    // BlackMIDIの超微小ノーツ（0秒）やバグノーツを弾いてメモリを節約
+                    if (dur > 0.001) {
+                        res.push({ 
+                            m: n, t: act[n].s, d: dur, v: act[n].v, i: act[n].i, ch: act[n].c, tr: t, p: false 
+                        });
+                    }
+                    delete act[n];
+                }
+            } else if (mType === 192) { 
+                inst = v.getUint8(tOff++); 
+            } else if (skipTypes.indexOf(String(mType)) !== -1) { 
+                tOff += 2; 
+            } else if (mType === 208) { 
+                tOff += 1; 
+            } else if (stat === 255) {
+                let m2 = v.getUint8(tOff++); let mV = readVLQ(v, tOff); tOff += mV.idx;
+                if (m2 === 81) bpm = 60000000 / ((v.getUint8(tOff) << 16) | (v.getUint8(tOff + 1) << 8) | v.getUint8(tOff + 2));
+                tOff += mV.val;
+            } else if (sysTypes.indexOf(String(stat)) !== -1) { 
+                let sV = readVLQ(v, tOff); tOff += sV.idx + sV.val; 
+            } else { 
+                break; 
+            }
+        }
+        off = tEnd;
+    }
+    return res;
+}
+
+fInp.addEventListener('change', async (e) => {
+    const fs = e.target.files; if (!fs || fs.length === 0) return;
+    const file = fs;
+    showLog("BlackMIDI解析中（高密度処理）...: " + file.name);
+    
+    initAudioEngine();
+    
+    try {
+        const buf = await file.arrayBuffer(); 
+        notes = parseMIDI(buf);
+        notes.sort((a, b) => a.t - b.t);
+        
+        isPlaying = false; pauseTime = 0;
+        pBtn.style.display = 'block'; pBtn.textContent = '▶ 再生';
+        showLog("BlackMIDI 読み込み成功! 総ノーツ数: " + notes.length);
+        
+        notes.forEach(n => n.p = false);
+        draw(0);
+    } catch (err) { 
+        showLog("失敗: " + err.message); 
+    }
+});
+
+pBtn.addEventListener('click', () => {
+    initAudioEngine();
+    if (isPlaying) { 
+        isPlaying = false; pauseTime = audioCtx.currentTime - startTime; pBtn.textContent = '▶ 再生'; showLog("一時停止"); 
+    } else { 
+        isPlaying = true; startTime = audioCtx.currentTime - pauseTime; pBtn.textContent = '再生中...'; animate(); 
+    }
+});
+
+function animate() {
+    if (!isPlaying) return; 
+    const cTime = audioCtx.currentTime - startTime;
+    
+    // 超高速トリガー：現在時刻を越えた音だけを素早く検知して発音
+    notes.forEach(n => { 
+        if (!n.p && cTime >= n.t) { 
+            playTone(n.m, n.d, n.v, n.ch, n.i); n.p = true; 
+        } 
+    });
+    
+    cleanVoices(); // ボイス配列の定期掃除
+    draw(cTime); 
+    requestAnimationFrame(animate);
+}
+
+function draw(cTime) {
+    const w = window.innerWidth, h = window.innerHeight, kW = w / NOTE_CNT, act = new Set(), actC = {};
+    ctx.fillStyle = '#000000'; ctx.fillRect(0, 0, w, h); // BlackMIDIが映える完全な漆黒背景
+    
+    // 背景グリッドは描画負荷を下げるためBlackMIDI再生時は非表示（真っ黒に）
+
+    // 画面外カリング：現在画面内に見えている時間軸の範囲を計算
+    const viewMinTime = cTime - 2;
+    const viewMaxTime = cTime + (kyY / SPEED);
+    
+    notes.forEach(n => {
+        if (n.m < MIN_NOTE || n.m > MAX_NOTE) return; 
+        
+        // ⚡超重要：画面外にあるノーツは1ピクセルも描画計算せず即座にパス（カリング）
+        if (n.t + n.d < viewMinTime || n.t > viewMaxTime) return;
+        
+        const x = (n.m - MIN_NOTE) * kW, y = kyY - (n.t - cTime) * SPEED, nH = n.d * SPEED;
+        const c = (n.ch === 9) ? '#555555' : CLRS[n.tr % CLRS.length];
+        
+        if (cTime >= n.t && cTime <= n.t + n.d) { 
+            act.add(n.m); actC[n.m] = c; ctx.fillStyle = '#ffffff'; 
+        } else { 
+            ctx.fillStyle = c; 
+        }
+        
+        // BlackMIDIの超高密度を綺麗に映すため、丸角処理を省き直線矩形で超高速レンダリング
+        ctx.fillRect(x + 1, y - nH, kW - 2, nH);
+    });
+    
+    // 鍵盤の描画
+    for (let i = 0; i < NOTE_CNT; i++) {
+        const nId = MIN_NOTE + i, x = i * kW, rem = nId % 12;
+        const isS = (rem===1||rem===3||rem===6||rem===8||rem===10);
+        ctx.fillStyle = act.has(nId) ? actC[nId] : (isS ? '#151515' : '#ffffff');
+        ctx.fillRect(x, kyY, kW - 1, h - kyY);
+    }
+    
+    // 判定ライン
+    ctx.strokeStyle = '#ff0055'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(0, kyY); ctx.lineTo(w, kyY); ctx.stroke();
+}
+</script>
+</body>
+</html>
