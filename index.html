@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
+    <title>本格高音質 MIDI Viewer & Player</title>
+    <!-- ブラウザで本物の楽器・ドラムを鳴らすための世界標準サンプラーライブラリ -->
+    <script src="https://github.io"></script>
+    <style>
+        body{margin:0;background:#121212;color:#fff;font-family:sans-serif;overflow:hidden;position:fixed;width:100%;height:100%;}
+        #ctl{position:absolute;top:10px;left:10px;z-index:10;display:flex;gap:10px;}
+        input[type="file"]{display:none;}
+        .btn{background:#2563eb;color:#fff;padding:8px 16px;border-radius:20px;font-size:14px;font-weight:bold;border:none;cursor:pointer;box-shadow:0 4px 6px rgba(0,0,0,0.3);}
+        canvas{display:block;width:100vw;height:100vh;}
+        #log{position:absolute;bottom:110px;left:10px;right:10px;background:rgba(0,0,0,0.8);color:#00ff00;font-family:monospace;font-size:11px;padding:6px;max-height:50px;z-index:20;pointer-events:none;border-radius:4px;}
+    </style>
+</head>
+<body>
+    <div id="ctl">
+        <label class="btn" for="fInp">📁 MIDIを開く</label>
+        <input type="file" id="fInp" accept=".mid,.midi">
+        <button class="btn" id="pBtn" style="display:none;">▶ 再生</button>
+    </div>
+    <div id="log">ログ: 準備完了。MIDIファイルを選択してください。</div>
+    <canvas id="cvs"></canvas>
+
+<script>
+const cvs = document.getElementById('cvs'), ctx = cvs.getContext('2d');
+const fInp = document.getElementById('fInp'), pBtn = document.getElementById('pBtn'), logDiv = document.getElementById('log');
+const MIN_NOTE = 36, MAX_NOTE = 96, NOTE_CNT = MAX_NOTE - MIN_NOTE + 1, SPEED = 200;
+let audioCtx = null, isPlaying = false, startTime = 0, pauseTime = 0, notes = [], kyY = 0;
+const CLRS = ['#38bdf8', '#f43f5e', '#10b981', '#fbbf24', '#a855f7', '#ec4899', '#f97316', '#14b8a6'];
+
+// 楽器サンプラーの設定
+let fontPlayer = new WebAudioFontPlayer();
+let loadedPresets = {}; // 読み込み済みの楽器データをキャッシュする
+
+function showLog(m) { logDiv.innerText = "ログ: " + m; }
+window.onerror = (m, s, l) => { showLog(`エラー: ${m} (L:${l})`); return false; };
+
+function resize() {
+    cvs.width = window.innerWidth * window.devicePixelRatio; cvs.height = window.innerHeight * window.devicePixelRatio;
+    ctx.scale(window.devicePixelRatio, window.devicePixelRatio); kyY = window.innerHeight - 100; draw(0);
+}
+window.addEventListener('resize', resize); resize();
+
+// 音源データのオンデマンド読み込みシステム
+async function loadInstrumentPreset(instNum, isDrum) {
+    if (!audioCtx) return null;
+    
+    // WebAudioFontの命名規則に従ってプリセット名を取得
+    let presetName = isDrum ? fontPlayer.loader.findDrumCollectionName(0) : fontPlayer.loader.findPresetName(instNum);
+    let nodeName = fontPlayer.loader.nodeName(presetName);
+    
+    if (loadedPresets[nodeName]) return loadedPresets[nodeName];
+
+    return new Promise((resolve) => {
+        fontPlayer.loader.loadPreset(audioCtx, nodeName, function() {
+            loadedPresets[nodeName] = window[nodeName];
+            resolve(loadedPresets[nodeName]);
+        });
+    });
+}
+
+function playTone(n, d, vel, ch, inst) {
+    if (!audioCtx) return;
+    const isDrum = (ch === 9); // MIDI規格上、10番目のチャンネル（chインデックス9）は必ずドラムパート
+    
+    let presetName = isDrum ? fontPlayer.loader.findDrumCollectionName(0) : fontPlayer.loader.findPresetName(inst);
+    let nodeName = fontPlayer.loader.nodeName(presetName);
+    let preset = loadedPresets[nodeName];
+    
+    if (!preset) return; // まだ読み込みが終わっていない楽器は安全にスルー
+    
+    const vol = (vel / 127) * 0.6; // 元音源のベロシティ（音量強弱）を完全反映
+    fontPlayer.queueWaveTable(audioCtx, audioCtx.destination, preset, audioCtx.currentTime, n, d, vol);
+}
+
+function readVLQ(v, o) {
+    let val = 0, idx = 0;
+    while (true) { let b = v.getUint8(o + idx); idx++; val = (val << 7) | (b & 127); if (!(b & 128)) break; }
+    return { val, idx };
+}
+function parseMIDI(buf) {
+    const v = new DataView(buf); let off = 0;
+    if (v.getUint32(0) !== 0x4D546864) throw new Error("無効なMIDIファイルです");
+    off = 8 + v.getUint32(4); let res = [], bpm = 120, tCnt = v.getUint16(10), tDiv = v.getUint16(12);
+    
+    for (let t = 0; t < tCnt; t++) {
+        if (off >= v.byteLength) break;
+        if (v.getUint32(off) !== 0x4D54726B) { off += 8 + v.getUint32(off + 4); continue; }
+        let tOff = off + 8, tEnd = tOff + v.getUint32(off + 4), cSec = 0, act = {}, rStat = 0, inst = 0;
+        
+        while (tOff < tEnd) {
+            let vlq = readVLQ(v, tOff); tOff += vlq.idx; cSec += vlq.val * (60 / (bpm * tDiv));
+            let stat = v.getUint8(tOff); if (stat & 128) { rStat = stat; tOff++; } else { stat = rStat; }
+            let mType = stat & 240, ch = stat & 15;
+            
+            if (mType === 144 || mType === 128) {
+                let n = v.getUint8(tOff), vel = v.getUint8(tOff + 1); tOff += 2;
+                if (mType === 144 && vel > 0) { 
+                    act[n] = { s: cSec, v: vel, i: inst, c: ch }; 
+                } else if (act[n]) {
+                    let dur = cSec - act[n].s;
+                    if (dur > 0) {
+                        res.push({ 
+                            m: n, t: act[n].s, d: dur, v: act[n].v, i: act[n].i, ch: act[n].c, tr: t, p: false 
+                        });
+                    }
+                    delete act[n];
+                }
+            } else if (mType === 192) { 
+                inst = v.getUint8(tOff++); // 楽器切り替え命令（プログラムチェンジ）を正確に記憶
+            } else if ([160, 176, 224].includes(mType)) { 
+                tOff += 2; 
+            } else if (mType === 208) { 
+                tOff += 1; 
+            } else if (stat === 255) {
+                let m2 = v.getUint8(tOff++); let mV = readVLQ(v, tOff); tOff += mV.idx;
+                if (m2 === 81) bpm = 60000000 / ((v.getUint8(tOff) << 16) | (v.getUint8(tOff + 1) << 8) | v.getUint8(tOff + 2));
+                tOff += mV.val;
+            } else if ([240, 247].includes(stat)) { 
+                let sV = readVLQ(v, tOff); tOff += sV.idx + sV.val; 
+            } else { 
+                break; 
+            }
+        }
+        off = tEnd;
+    }
+    return res;
+}
+
+fInp.addEventListener('change', async (e) => {
+    const fs = e.target.files; if (!fs || fs.length === 0) return;
+    const file = fs[0];
+    showLog("解析中: " + file.name);
+    
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    
+    try {
+        const buf = await file.arrayBuffer(); 
+        notes = parseMIDI(buf);
+        notes.sort((a, b) => a.t - b.t);
+        
+        showLog("音源データをバックグラウンドでロード中...");
+        pBtn.style.display = 'none'; // ロード完了まで隠す
+        
+        // 曲中で使われているユニークな楽器とドラムをすべて抽出し、事前にロードする
+        let requiredInstruments = new Set();
+        let needDrum = false;
+        notes.forEach(n => {
+            if (n.ch === 9) needDrum = true;
+            else requiredInstruments.add(n.i);
+        });
+        
+        let loadPromises = [];
+        requiredInstruments.forEach(instNum => {
+            loadPromises.push(loadInstrumentPreset(instNum, false));
+        });
+        if (needDrum) {
+            loadPromises.push(loadInstrumentPreset(0, true));
+        }
+        
+        await Promise.all(loadPromises);
+        
+        isPlaying = false; pauseTime = 0;
+        pBtn.style.display = 'block'; pBtn.textContent = '▶ 再生';
+        showLog(`読み込み成功! 全楽器・ドラム再現完了。ノーツ数: ${notes.length}`);
+        
+        // 再初期化（過去の再生フラグをリセット）
+        notes.forEach(n => n.p = false);
+        draw(0);
+    } catch (err) { 
+        showLog("失敗: " + err.message); 
+    }
+});
+
+pBtn.addEventListener('click', () => {
+    if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+    if (isPlaying) { 
+        isPlaying = false; pauseTime = audioCtx.currentTime - startTime; pBtn.textContent = '▶ 再生'; showLog("一時停止"); 
+    } else { 
+        isPlaying = true; startTime = audioCtx.currentTime - pauseTime; pBtn.textContent = '⏸ 一時停止'; showLog("再生中..."); animate(); 
+    }
+});
+
+function animate() {
+    if (!isPlaying) return; const cTime = audioCtx.currentTime - startTime;
+    notes.forEach(n => { 
+        if (!n.p && cTime >= n.t) { 
+            playTone(n.m, n.d, n.v, n.ch, n.i); n.p = true; 
+        } 
+    });
+    draw(cTime); requestAnimationFrame(animate);
+}
+
+function draw(cTime) {
+    const w = window.innerWidth, h = window.innerHeight, kW = w / NOTE_CNT, act = new Set(), actC = {};
+    ctx.fillStyle = '#121212'; ctx.fillRect(0, 0, w, h);
+    ctx.strokeStyle = '#222'; ctx.lineWidth = 1;
+    for (let i = 0; i <= NOTE_CNT; i++) { ctx.beginPath(); ctx.moveTo(i * kW, 0); ctx.lineTo(i * kW, kyY); ctx.stroke(); }
+    
+    notes.forEach(n => {
+        if (n.m < MIN_NOTE || n.m > MAX_NOTE) return; // 表示音域外はパス
+        if (n.t + n.d < cTime - 2 || n.t > cTime + (kyY / SPEED)) return;
+        const x = (n.m - MIN_NOTE) * kW, y = kyY - (n.t - cTime) * SPEED, nH = n.d * SPEED;
+        
+        // ドラムチャンネル（ch 9）はグレー、それ以外はトラックごとのカラー
+        const c = (n.ch === 9) ? '#555555' : CLRS[n.tr % CLRS.length];
+        
+        if (cTime >= n.t && cTime <= n.t + n.d) { 
+            act.add(n.m); actC[n.m] = c; ctx.fillStyle = '#fff'; 
+        } else { 
+            ctx.fillStyle = c; 
+        }
+        ctx.beginPath(); ctx.roundRect(x + 2, y - nH, kW - 4, nH, 4); ctx.fill();
+    });
+    
+    for (let i = 0; i < NOTE_CNT; i++) {
+        const nId = MIN_NOTE + i, x = i * kW, rem = nId % 12, isS = [1,3,6,8,10].includes(rem);
+        ctx.fillStyle = act.has(nId) ? actC[nId] : (isS ? '#1e1e1e' : '#fff');
+        ctx.fillRect(x, kyY, kW - 1, h - kyY);
+        ctx.strokeStyle = '#888'; ctx.strokeRect(x, kyY, kW - 1, h - kyY);
+    }
+    ctx.strokeStyle = '#ff0055'; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(0, kyY); ctx.lineTo(w, kyY); ctx.stroke();
+}
+</script>
+</body>
+</html>
