@@ -128,18 +128,19 @@ function playTone(n, d, vel, ch, inst, tr, targetTime) {
         attackGain.gain.setValueAtTime(vol * 0.25, playTime);
         attackGain.gain.exponentialRampToValueAtTime(0.001, playTime + 0.015);
         attackMod.connect(attackGain); attackGain.connect(mainGain);
-        attackMod.start(attackMod.start ? playTime : 0); attackMod.stop(playTime + 0.02);
+        attackMod.start(playTime); attackMod.stop(playTime + 0.02);
     }
 
     gain.gain.setValueAtTime(0, playTime);
     gain.gain.linearRampToValueAtTime(vol, playTime + 0.003); // 立ち上がり
 
     if (isPiano) {
-        // ピアノ独自の「だんだん音が小さくなる減衰（ディケイ）」
+        // ⚡【新実装】ピアノ独自の「だんだん音が小さくなる減衰（ディケイ）」を数式でシミュレート
+        // 鍵盤が押されている間、時間とともに音量が1/3以下に滑らかに落ちていき、離した瞬間（d秒後）に綺麗に消える
         const sustainVolume = vol * 0.25; 
         gain.gain.exponentialRampToValueAtTime(sustainVolume, playTime + Math.min(d, 2.5)); 
         gain.gain.setValueAtTime(sustainVolume, playTime + d);
-        gain.gain.linearRampToValueAtTime(0.0001, playTime + d + 0.04); 
+        gain.gain.linearRampToValueAtTime(0.0001, playTime + d + 0.04); // 離した時のダンパーの消音
     } else {
         // ピアノ以外（ストリングスなど）は長さを維持
         gain.gain.setValueAtTime(vol, playTime + d - 0.005);
@@ -147,7 +148,7 @@ function playTone(n, d, vel, ch, inst, tr, targetTime) {
     }
     
     osc.connect(gain); gain.connect(mainGain);
-    osc.start(osc.start ? playTime : 0); osc.stop(playTime + d + 0.05);
+    osc.start(playTime); osc.stop(playTime + d + 0.05);
     
     activeVoices.push({ osc: osc, gain: gain, time: playTime });
 }
@@ -166,27 +167,41 @@ function parseMIDI(buf) {
     const v = new DataView(buf); let off = 0;
     if (v.getUint32(0) !== 0x4D546864) throw new Error("無効なMIDIファイルです");
     
-    const hLen = v.getUint32(4), tCnt = v.getUint16(10), tDiv = v.getUint16(12);
+    const hLen = v.getUint32(4);
+    const tCnt = v.getUint16(10);
+    const tDiv = v.getUint16(12);
     if (tDiv & 0x8000) throw new Error("未対応の形式です");
     
-    let tempoEvents = [], trackOffsets = [], trackEnds = [];
+    let tempoEvents = [];
+    let trackOffsets = [];
+    let trackEnds = [];
+    
     off = 8 + hLen;
     for (let t = 0; t < tCnt; t++) {
         if (off >= v.byteLength) break;
         if (v.getUint32(off) !== 0x4D54726B) { off += 8 + v.getUint32(off + 4); continue; }
         const tLen = v.getUint32(off + 4);
-        trackOffsets.push(off + 8); trackEnds.push(off + 8 + tLen);
+        trackOffsets.push(off + 8);
+        trackEnds.push(off + 8 + tLen);
         off += 8 + tLen;
     }
 
     let allNotesRaw = [];
-    const skipTypes = "160_176_224", sysTypes = "240_247";
+    const skipTypes = "160_176_224";
+    const sysTypes = "240_247";
 
     for (let t = 0; t < trackOffsets.length; t++) {
-        let tOff = trackOffsets[t], tEnd = trackEnds[t], currentTick = 0, rStat = 0, inst = 0, act = {};
+        let tOff = trackOffsets[t];
+        let tEnd = trackEnds[t];
+        let currentTick = 0;
+        let rStat = 0;
+        let inst = 0;
+        let act = {};
 
         while (tOff < tEnd) {
-            let vlq = readVLQ(v, tOff); tOff += vlq.idx; currentTick += vlq.val;
+            let vlq = readVLQ(v, tOff); tOff += vlq.idx;
+            currentTick += vlq.val;
+
             let stat = v.getUint8(tOff); if (stat & 128) { rStat = stat; tOff++; } else { stat = rStat; }
             let mType = stat & 240, ch = stat & 15;
 
@@ -226,7 +241,9 @@ function parseMIDI(buf) {
     }
 
     tempoEvents.sort((a, b) => a.tick - b.tick);
-    if (tempoEvents.length === 0 || tempoEvents.tick > 0) { tempoEvents.unshift({ tick: 0, bpm: 120 }); }
+    if (tempoEvents.length === 0 || tempoEvents.tick > 0) {
+        tempoEvents.unshift({ tick: 0, bpm: 120 });
+    }
 
     function tickToSecond(tick) {
         let sec = 0, curTick = 0, curBPM = 120;
@@ -234,7 +251,8 @@ function parseMIDI(buf) {
             if (tick <= tempoEvents[i].tick) break;
             let delta = tempoEvents[i].tick - curTick;
             sec += delta * (60 / (curBPM * tDiv));
-            curTick = tempoEvents[i].tick; curBPM = tempoEvents[i].bpm;
+            curTick = tempoEvents[i].tick;
+            curBPM = tempoEvents[i].bpm;
         }
         sec += (tick - curTick) * (60 / (curBPM * tDiv));
         return sec;
@@ -245,13 +263,12 @@ function parseMIDI(buf) {
         let n = allNotesRaw[i];
         let tSec = tickToSecond(n.startTick);
         let eSec = tickToSecond(n.endTick);
-        finalNotes.push({ m: n.m, t: tSec, d: eSec - tSec, v: n.v, i: n.i, ch: n.ch, tr: n.tr, p: false });
+        finalNotes.push({
+            m: n.m, t: tSec, d: eSec - tSec, v: n.v, i: n.i, ch: n.ch, tr: n.tr, p: false
+        });
     }
     return finalNotes;
 }
-
-// ⚡ 発音トリガー用のポインタを最適化（毎回0番目から走査するのを防止）
-let audioPlaybackPointer = 0;
 
 fInp.addEventListener('change', async (e) => {
     const fs = e.target.files; if (!fs || fs.length === 0) return;
@@ -265,7 +282,7 @@ fInp.addEventListener('change', async (e) => {
         notes = parseMIDI(buf);
         notes.sort((a, b) => a.t - b.t);
         
-        isPlaying = false; pauseTime = 0; audioPlaybackPointer = 0;
+        isPlaying = false; pauseTime = 0;
         lastPlayTimes = {}; 
         pBtn.style.display = 'block'; pBtn.textContent = '▶ 再生';
         showLog("読み込み成功! 総ノーツ数: " + notes.length);
@@ -291,28 +308,15 @@ function animate() {
     const cTime = audioCtx.currentTime - startTime;
     const lookAheadTime = cTime + 0.05;
     
-    // ⚡ 発音スキャンの超軽量化：すでに通り過ぎた古い音は二度とループで回さない
-    while (audioPlaybackPointer < notes.length) {
-        const n = notes[audioPlaybackPointer];
-        if (n.t > lookAheadTime) break; 
+    notes.forEach(n => {
         if (!n.p && lookAheadTime >= n.t) {
             playTone(n.m, n.d, n.v, n.ch, n.i, n.tr, n.t); n.p = true;
         }
-        audioPlaybackPointer++;
-    }
+    });
     
-    cleanVoices(); draw(cTime); requestAnimationFrame(animate);
-}
-
-// ⚡ 二分探索（バイナリサーチ）で、現在画面に映るべき最初のノーツ番号を割り出す爆速関数
-function findFirstVisibleIndex(time) {
-    let low = 0, high = notes.length - 1;
-    while (low <= high) {
-        let mid = (low + high) >> 1;
-        if (notes[mid].t < time) { low = mid + 1; } 
-        else { high = mid - 1; }
-    }
-    return low;
+    cleanVoices();
+    draw(cTime);
+    requestAnimationFrame(animate);
 }
 
 function draw(cTime) {
@@ -322,20 +326,16 @@ function draw(cTime) {
     const viewMinTime = cTime - 2;
     const viewMaxTime = cTime + (kyY / SPEED);
     
+    // ⚡【新実装】描画のバッチ処理グループの初期化
     let colorPaths = {};
     for (let cIdx = 0; cIdx < CLRS.length; cIdx++) { colorPaths[CLRS[cIdx]] = []; }
-    colorPaths['#555555'] = []; 
-    let hitNotes = []; 
-
-    // ⚡【核心】10万ノーツあっても、画面内の数百個だけをピンポイントにループ処理する超軽量化
-    let startIndex = findFirstVisibleIndex(viewMinTime);
+    colorPaths['#555555'] = []; // ドラム用
+    let hitNotes = []; // ヒット中の光る白ノーツ用
     
-    for (let i = startIndex; i < notes.length; i++) {
-        const n = notes[i];
-        if (n.t > viewMaxTime) break; // 画面外（未来）に出たら、以降の処理をすべて即座に打ち切る
-        if (n.m < MIN_NOTE || n.m > MAX_NOTE) continue;
-        if (n.t + n.d < viewMinTime) continue; // 過去の長すぎるノーツのケア
-
+    notes.forEach(n => {
+        if (n.m < MIN_NOTE || n.m > MAX_NOTE) return;
+        if (n.t + n.d < viewMinTime || n.t > viewMaxTime) return;
+        
         const x = (n.m - MIN_NOTE) * kW, y = kyY - (n.t - cTime) * SPEED, nH = n.d * SPEED;
         const c = (n.ch === 9) ? '#555555' : CLRS[n.tr % CLRS.length];
         
@@ -343,27 +343,37 @@ function draw(cTime) {
             act.add(n.m); actC[n.m] = c;
             hitNotes.push({x: x + 1, y: y - nH, w: kW - 2, h: nH});
         } else {
+            // 色ごとの座標配列へプール
             colorPaths[c].push({x: x + 1, y: y - nH, w: kW - 2, h: nH});
         }
-    }
+    });
     
-    // 一括塗りつぶし
+    // ⚡【高速化の核心】色ごとに1回だけパスをまとめて一括塗りつぶし（数万回 ➔ 数回へ削減）
     Object.keys(colorPaths).forEach(color => {
-        const arr = colorPaths[color]; if (arr.length === 0) return;
-        ctx.fillStyle = color; ctx.beginPath();
-        for (let i = 0; i < arr.length; i++) { ctx.rect(arr[i].x, arr[i].y, arr[i].w, arr[i].h); }
+        const arr = colorPaths[color];
+        if (arr.length === 0) return;
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        for (let i = 0; i < arr.length; i++) {
+            ctx.rect(arr[i].x, arr[i].y, arr[i].w, arr[i].h);
+        }
         ctx.fill();
     });
     
+    // 光る白ノーツを一括描画
     if (hitNotes.length > 0) {
-        ctx.fillStyle = '#ffffff'; ctx.beginPath();
-        for (let i = 0; i < hitNotes.length; i++) { ctx.rect(hitNotes[i].x, hitNotes[i].y, hitNotes[i].w, hitNotes[i].h); }
+        ctx.fillStyle = '#ffffff';
+        ctx.beginPath();
+        for (let i = 0; i < hitNotes.length; i++) {
+            ctx.rect(hitNotes[i].x, hitNotes[i].y, hitNotes[i].w, hitNotes[i].h);
+        }
         ctx.fill();
     }
     
     // 鍵盤の描画
     for (let i = 0; i < NOTE_CNT; i++) {
-        const nId = MIN_NOTE + i, x = i * kW, rem = nId % 12, isS = (rem===1||rem===3||rem===6||rem===8||rem===10);
+        const nId = MIN_NOTE + i, x = i * kW, rem = nId % 12;
+        const isS = (rem===1||rem===3||rem===6||rem===8||rem===10);
         ctx.fillStyle = act.has(nId) ? actC[nId] : (isS ? '#151515' : '#ffffff');
         ctx.fillRect(x, kyY, kW - 1, h - kyY);
     }
