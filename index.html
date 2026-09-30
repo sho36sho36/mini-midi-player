@@ -3,7 +3,6 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
-
 <title>超軽量 BlackMIDI Player</title>
 
 <style>
@@ -42,12 +41,8 @@ input[type="file"]{
     cursor:pointer;
 }
 
-.btn:hover{
-    background:#1d4ed8;
-}
-
 .btn:active{
-    background:#1e40af;
+    transform:scale(.97);
 }
 
 canvas{
@@ -77,25 +72,12 @@ canvas{
 <body>
 
 <div id="ctl">
+    <label class="btn" for="fInp">📁 MIDIを開く</label>
+    <input type="file" id="fInp" accept=".mid,.midi">
 
-    <label class="btn" for="fInp">
-        📁 MIDIを開く
-    </label>
-
-    <input
-        type="file"
-        id="fInp"
-        accept=".mid,.midi"
-    >
-
-    <button
-        class="btn"
-        id="pBtn"
-        style="display:none;"
-    >
+    <button class="btn" id="pBtn" style="display:none;">
         ▶ 再生
     </button>
-
 </div>
 
 <div id="log">
@@ -105,93 +87,68 @@ canvas{
 <canvas id="cvs"></canvas>
 
 <script>
+"use strict";
 
 /* =========================================================
    基本設定
 ========================================================= */
 
-const cvs =
-    document.getElementById('cvs');
+const cvs = document.getElementById("cvs");
+const ctx = cvs.getContext("2d", {
+    alpha:false,
+    desynchronized:true
+});
 
-const ctx =
-    cvs.getContext('2d', {
-        alpha: false
-    });
-
-const fInp =
-    document.getElementById('fInp');
-
-const pBtn =
-    document.getElementById('pBtn');
-
-const logDiv =
-    document.getElementById('log');
-
-
-/* =========================================================
-   表示設定
-========================================================= */
+const fInp = document.getElementById("fInp");
+const pBtn = document.getElementById("pBtn");
+const logDiv = document.getElementById("log");
 
 const MIN_NOTE = 36;
 const MAX_NOTE = 96;
-
-const NOTE_CNT =
-    MAX_NOTE - MIN_NOTE + 1;
+const NOTE_CNT = MAX_NOTE - MIN_NOTE + 1;
 
 const SPEED = 250;
 
+/*
+ * 音声関係
+ *
+ * AudioWorklet側で最大同時発音数を制限。
+ * BlackMIDIでは無限に音を鳴らすことはできないため、
+ * 古い音を新しい音へ自動的に置き換える。
+ */
+const MAX_AUDIO_VOICES = 96;
+
+const AUDIO_LOOKAHEAD = 0.15;
+const AUDIO_SCHEDULE_INTERVAL = 25;
+
 
 /* =========================================================
-   オーディオ
+   状態
 ========================================================= */
 
 let audioCtx = null;
-let mainGain = null;
-let reverbNode = null;
+let audioWorkletNode = null;
+let masterGain = null;
 
-
-/* =========================================================
-   再生状態
-========================================================= */
+let audioScheduler = null;
+let audioPointer = 0;
 
 let isPlaying = false;
+let isPaused = false;
 
 let startTime = 0;
-
 let pauseTime = 0;
 
 let notes = [];
 
+let duration = 0;
+let cachedDuration = 0;
+
 let kyY = 0;
 
-let loopEnabled = false;
+let currentFileName = "";
 
-
-/* =========================================================
-   音声設定
-========================================================= */
-
-const MAX_VOICES = 128;
-
-let activeVoices = [];
-
-
-/*
-    note + channelごとの最終発音時間。
-
-    元コードのObjectをやめて固定配列にすることで、
-    BlackMIDI大量ノーツ時のメモリ増加を抑える。
-*/
-
-const lastPlayTimes =
-    new Float64Array(16 * 128);
-
-
-/*
-    0 = 一度も鳴っていない
-*/
-
-lastPlayTimes.fill(-999);
+let playbackGeneration = 0;
 
 
 /* =========================================================
@@ -199,795 +156,892 @@ lastPlayTimes.fill(-999);
 ========================================================= */
 
 const CLRS = [
-    '#38bdf8',
-    '#f43f5e',
-    '#10b981',
-    '#fbbf24',
-    '#a855f7',
-    '#ec4899',
-    '#f97316',
-    '#14b8a6'
+    "#38bdf8",
+    "#f43f5e",
+    "#10b981",
+    "#fbbf24",
+    "#a855f7",
+    "#ec4899",
+    "#f97316",
+    "#14b8a6"
 ];
+
+
+/* =========================================================
+   キャンバス
+========================================================= */
+
+function resizeCanvas(){
+
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+
+    const w = window.innerWidth;
+    const h = window.innerHeight;
+
+    cvs.width = Math.floor(w * dpr);
+    cvs.height = Math.floor(h * dpr);
+
+    cvs.style.width = w + "px";
+    cvs.style.height = h + "px";
+
+    ctx.setTransform(dpr,0,0,dpr,0,0);
+}
+
+window.addEventListener("resize",resizeCanvas);
+resizeCanvas();
 
 
 /* =========================================================
    ログ
 ========================================================= */
 
-function showLog(m){
-
-    logDiv.innerText =
-        "ログ: " + m;
+function log(text){
+    logDiv.textContent = "ログ: " + text;
 }
 
 
-window.onerror =
-    (m, s, l) => {
-
-        showLog(
-            "エラー: " +
-            m +
-            " (L:" +
-            l +
-            ")"
-        );
-
-        return false;
-    };
-
-
 /* =========================================================
-   Canvasサイズ
+   MIDI → 周波数
 ========================================================= */
 
-let dpr = 1;
+function noteToFreq(note){
 
-function resize(){
-
-    const w =
-        window.innerWidth;
-
-    const h =
-        window.innerHeight;
-
-    /*
-        高DPIを無制限にすると
-        BlackMIDIでは描画負荷が上がるので
-        最大2倍まで。
-    */
-
-    dpr =
-        Math.min(
-            window.devicePixelRatio || 1,
-            2
-        );
-
-    cvs.width =
-        Math.floor(w * dpr);
-
-    cvs.height =
-        Math.floor(h * dpr);
-
-    /*
-        scale()を毎回積み重ねない。
-    */
-
-    ctx.setTransform(
-        dpr,
-        0,
-        0,
-        dpr,
-        0,
-        0
+    return 440 * Math.pow(
+        2,
+        (note - 69) / 12
     );
-
-    kyY =
-        h - 100;
-
-    draw(0);
 }
 
 
-window.addEventListener(
-    'resize',
-    resize
-);
-
-resize();
-
-
 /* =========================================================
-   軽量リバーブ
+   AudioWorklet生成
+=========================================================
+
+   音符ごとにOscillatorNodeを作らない。
+
+   AudioWorklet内で全部の音を合成する。
+
+   これが今回の大きな軽量化ポイント。
 ========================================================= */
 
-function createReverbBuffer(
-    audio,
-    duration,
-    decay
-){
+const workletCode = `
 
-    const rate =
-        audio.sampleRate;
+class BlackMIDIProcessor extends AudioWorkletProcessor {
 
-    const length =
-        Math.floor(
-            rate * duration
-        );
+    constructor(){
 
-    const buffer =
-        audio.createBuffer(
-            2,
-            length,
-            rate
-        );
+        super();
+
+        this.voices = [];
+
+        this.maxVoices = ${MAX_AUDIO_VOICES};
+
+        this.port.onmessage = (event)=>{
+
+            const data = event.data;
+
+            if(!data) return;
+
+            if(data.type === "note"){
+
+                this.noteOn(
+                    data.note,
+                    data.velocity,
+                    data.program,
+                    data.channel,
+                    data.pan,
+                    data.duration
+                );
+
+            }else if(data.type === "stop"){
+
+                this.voices.length = 0;
+
+            }else if(data.type === "clear"){
+
+                this.voices.length = 0;
+            }
+        };
+    }
 
 
-    for(
-        let channel = 0;
-        channel < 2;
-        channel++
-    ){
+    /* -----------------------------------------------------
+       波形
+    ----------------------------------------------------- */
 
-        const data =
-            buffer.getChannelData(
-                channel
+    waveform(t, type){
+
+        const p = t - Math.floor(t);
+
+        if(type === 0){
+
+            return Math.sin(
+                2 * Math.PI * p
             );
 
+        }else if(type === 1){
+
+            return 2 * p - 1;
+
+        }else if(type === 2){
+
+            return p < 0.5 ? 1 : -1;
+
+        }else if(type === 3){
+
+            return 1 - 4 * Math.abs(
+                Math.round(p) - p
+            );
+        }
+
+        return Math.sin(
+            2 * Math.PI * p
+        );
+    }
+
+
+    /* -----------------------------------------------------
+       MIDI Program → 簡易音色
+    ----------------------------------------------------- */
+
+    getInstrument(program){
+
+        /*
+         * 0-7
+         * Acoustic Piano
+         */
+        if(program <= 7){
+
+            return {
+                wave:0,
+                harmonic:1.0,
+                attack:0.004,
+                release:0.18,
+                brightness:0.45
+            };
+        }
+
+        /*
+         * 8-15
+         * Chromatic percussion
+         */
+        if(program <= 15){
+
+            return {
+                wave:2,
+                harmonic:0.8,
+                attack:0.002,
+                release:0.12,
+                brightness:0.75
+            };
+        }
+
+        /*
+         * 16-23
+         * Organ
+         */
+        if(program <= 23){
+
+            return {
+                wave:1,
+                harmonic:0.65,
+                attack:0.025,
+                release:0.28,
+                brightness:0.6
+            };
+        }
+
+        /*
+         * 24-31
+         * Guitar
+         */
+        if(program <= 31){
+
+            return {
+                wave:3,
+                harmonic:0.75,
+                attack:0.006,
+                release:0.2,
+                brightness:0.5
+            };
+        }
+
+        /*
+         * 32-39
+         * Bass
+         */
+        if(program <= 39){
+
+            return {
+                wave:0,
+                harmonic:1.1,
+                attack:0.008,
+                release:0.22,
+                brightness:0.32
+            };
+        }
+
+        /*
+         * 40-47
+         * Strings
+         */
+        if(program <= 47){
+
+            return {
+                wave:3,
+                harmonic:0.72,
+                attack:0.055,
+                release:0.42,
+                brightness:0.48
+            };
+        }
+
+        /*
+         * 48-55
+         * Ensemble
+         */
+        if(program <= 55){
+
+            return {
+                wave:3,
+                harmonic:0.62,
+                attack:0.045,
+                release:0.38,
+                brightness:0.5
+            };
+        }
+
+        /*
+         * 56-63
+         * Brass
+         */
+        if(program <= 63){
+
+            return {
+                wave:1,
+                harmonic:0.72,
+                attack:0.025,
+                release:0.18,
+                brightness:0.72
+            };
+        }
+
+        /*
+         * 64-71
+         * Reed
+         */
+        if(program <= 71){
+
+            return {
+                wave:0,
+                harmonic:0.8,
+                attack:0.018,
+                release:0.22,
+                brightness:0.6
+            };
+        }
+
+        /*
+         * 72-79
+         * Pipe
+         */
+        if(program <= 79){
+
+            return {
+                wave:0,
+                harmonic:0.48,
+                attack:0.018,
+                release:0.3,
+                brightness:0.42
+            };
+        }
+
+        /*
+         * 80-87
+         * Synth lead
+         */
+        if(program <= 87){
+
+            return {
+                wave:1,
+                harmonic:0.7,
+                attack:0.008,
+                release:0.2,
+                brightness:0.7
+            };
+        }
+
+        /*
+         * 88-95
+         * Synth pad
+         */
+        if(program <= 95){
+
+            return {
+                wave:3,
+                harmonic:0.5,
+                attack:0.08,
+                release:0.5,
+                brightness:0.4
+            };
+        }
+
+        /*
+         * 96-103
+         * FX
+         */
+        if(program <= 103){
+
+            return {
+                wave:2,
+                harmonic:0.55,
+                attack:0.01,
+                release:0.25,
+                brightness:0.75
+            };
+        }
+
+        /*
+         * 104-111
+         * Ethnic
+         */
+        if(program <= 111){
+
+            return {
+                wave:3,
+                harmonic:0.7,
+                attack:0.015,
+                release:0.3,
+                brightness:0.65
+            };
+        }
+
+        /*
+         * 112-119
+         * Percussive
+         */
+        if(program <= 119){
+
+            return {
+                wave:2,
+                harmonic:0.8,
+                attack:0.002,
+                release:0.1,
+                brightness:0.8
+            };
+        }
+
+        return {
+            wave:0,
+            harmonic:0.6,
+            attack:0.01,
+            release:0.25,
+            brightness:0.5
+        };
+    }
+
+
+    /* -----------------------------------------------------
+       ノート開始
+    ----------------------------------------------------- */
+
+    noteOn(
+        note,
+        velocity,
+        program,
+        channel,
+        pan,
+        duration
+    ){
+
+        /*
+         * BlackMIDI用。
+         *
+         * 発音数が限界を超えた場合、
+         * 最も古い音を消す。
+         */
+
+        if(this.voices.length >= this.maxVoices){
+
+            let oldest = 0;
+            let oldestAge = this.voices[0].age;
+
+            for(let i=1;i<this.voices.length;i++){
+
+                if(this.voices[i].age < oldestAge){
+
+                    oldest = i;
+                    oldestAge = this.voices[i].age;
+                }
+            }
+
+            this.voices.splice(oldest,1);
+        }
+
+
+        const inst = this.getInstrument(program);
+
+        const freq =
+            440 *
+            Math.pow(
+                2,
+                (note - 69) / 12
+            );
+
+
+        /*
+         * velocity
+         */
+        const level =
+            Math.max(
+                0.02,
+                velocity / 127
+            );
+
+
+        /*
+         * ドラムチャンネル
+         */
+        const drum =
+            channel === 9;
+
+
+        this.voices.push({
+
+            note:note,
+
+            freq:freq,
+
+            velocity:level,
+
+            program:program,
+
+            channel:channel,
+
+            pan:Math.max(-1,Math.min(1,pan)),
+
+            duration:Math.max(
+                0.01,
+                duration
+            ),
+
+            age:currentFrame,
+
+            phase:0,
+
+            inst:inst,
+
+            drum:drum,
+
+            time:0
+        });
+    }
+
+
+    /* -----------------------------------------------------
+       1サンプル処理
+    ----------------------------------------------------- */
+
+    process(inputs,outputs){
+
+        const output = outputs[0];
+
+        const left = output[0];
+        const right = output[1] || output[0];
+
         for(
-            let i = 0;
-            i < length;
+            let i=0;
+            i<left.length;
             i++
         ){
 
-            data[i] =
-                (
-                    Math.random() * 2 - 1
-                ) *
-                Math.pow(
-                    1 - i / length,
-                    decay
-                );
-        }
-    }
+            let L = 0;
+            let R = 0;
 
-    return buffer;
-}
 
+            for(
+                let v=this.voices.length-1;
+                v>=0;
+                v--
+            ){
 
-/* =========================================================
-   Audio Engine
-========================================================= */
+                const voice = this.voices[v];
 
-function initAudioEngine(){
+                voice.time +=
+                    1 / sampleRate;
 
-    if(!audioCtx){
 
-        audioCtx =
-            new (
-                window.AudioContext ||
-                window.webkitAudioContext
-            )();
+                /*
+                 * ADSR
+                 */
 
+                let env = 1;
 
-        mainGain =
-            audioCtx.createGain();
+                const attack =
+                    voice.inst.attack;
 
+                const release =
+                    voice.inst.release;
 
-        /*
-            リバーブは元コードの雰囲気を維持。
-            ただし少し短くして軽量化。
-        */
 
-        reverbNode =
-            audioCtx.createConvolver();
+                if(voice.time < attack){
 
-        reverbNode.buffer =
-            createReverbBuffer(
-                audioCtx,
-                1.2,
-                2.4
-            );
+                    env =
+                        voice.time /
+                        attack;
 
+                }else if(
+                    voice.time >
+                    voice.duration - release
+                ){
 
-        const reverbGain =
-            audioCtx.createGain();
+                    const remain =
+                        voice.duration -
+                        voice.time;
 
-        reverbGain.gain.setValueAtTime(
-            0.14,
-            audioCtx.currentTime
-        );
+                    env =
+                        Math.max(
+                            0,
+                            remain / release
+                        );
+                }
 
 
-        const compressor =
-            audioCtx.createDynamicsCompressor();
+                /*
+                 * 終了
+                 */
 
-        compressor.threshold.setValueAtTime(
-            -10,
-            audioCtx.currentTime
-        );
-
-        compressor.knee.setValueAtTime(
-            15,
-            audioCtx.currentTime
-        );
-
-        compressor.ratio.setValueAtTime(
-            4,
-            audioCtx.currentTime
-        );
-
-        compressor.attack.setValueAtTime(
-            0.002,
-            audioCtx.currentTime
-        );
-
-        compressor.release.setValueAtTime(
-            0.08,
-            audioCtx.currentTime
-        );
+                if(
+                    voice.time >=
+                    voice.duration
+                ){
 
+                    this.voices.splice(v,1);
 
-        mainGain.connect(
-            compressor
-        );
+                    continue;
+                }
 
-        mainGain.connect(
-            reverbNode
-        );
 
-        reverbNode.connect(
-            reverbGain
-        );
-
-        reverbGain.connect(
-            compressor
-        );
-
-        compressor.connect(
-            audioCtx.destination
-        );
-    }
-
-
-    if(
-        audioCtx.state ===
-        'suspended'
-    ){
-
-        audioCtx.resume();
-    }
-}
-
-
-/* =========================================================
-   音程
-========================================================= */
-
-function noteFrequency(n){
-
-    return (
-        440 *
-        Math.pow(
-            2,
-            (n - 69) / 12
-        )
-    );
-}
-
-
-/* =========================================================
-   音色
-========================================================= */
-
-function getWaveform(inst){
-
-    /*
-        GM系をざっくり分類。
-        元コードの方向性を維持。
-    */
-
-    if(
-        inst >= 24 &&
-        inst <= 31
-    ){
-        return 'triangle';
-    }
-
-    if(
-        (
-            inst >= 16 &&
-            inst <= 23
-        ) ||
-        (
-            inst >= 40 &&
-            inst <= 51
-        )
-    ){
-        return 'sawtooth';
-    }
-
-    if(
-        inst >= 56 &&
-        inst <= 79
-    ){
-        return 'square';
-    }
-
-    return 'sine';
-}
-
-
-/* =========================================================
-   Voice停止
-========================================================= */
-
-function stopVoice(v){
-
-    if(!v){
-        return;
-    }
-
-    try{
-        v.gain.gain.cancelScheduledValues(
-            audioCtx.currentTime
-        );
-    }catch(e){}
-
-    try{
-        v.gain.gain.setTargetAtTime(
-            0,
-            audioCtx.currentTime,
-            0.004
-        );
-    }catch(e){}
-
-    try{
-        v.osc.stop(
-            audioCtx.currentTime + 0.025
-        );
-    }catch(e){}
-}
-
-
-/* =========================================================
-   音声クリーンアップ
-========================================================= */
-
-function cleanVoices(){
-
-    if(!audioCtx){
-        return;
-    }
-
-    const now =
-        audioCtx.currentTime;
-
-    /*
-        配列をfilter()で毎回作り直さない。
-    */
-
-    let write = 0;
+                /*
+                 * 音色
+                 */
 
-    for(
-        let i = 0;
-        i < activeVoices.length;
-        i++
-    ){
+                const f =
+                    voice.freq;
 
-        const v =
-            activeVoices[i];
 
-        if(
-            now <
-            v.end
-        ){
+                const phase =
+                    voice.phase;
 
-            activeVoices[write++] =
-                v;
 
-        }else{
+                let sample;
 
-            try{
-                v.osc.disconnect();
-            }catch(e){}
 
-            try{
-                v.gain.disconnect();
-            }catch(e){}
-        }
-    }
+                if(voice.drum){
 
-    activeVoices.length =
-        write;
-}
+                    /*
+                     * 簡易ドラム。
+                     * MIDI channel 10
+                     */
 
+                    const noise =
+                        Math.random() * 2 - 1;
 
-/* =========================================================
-   NOTE再生
-========================================================= */
+                    const kick =
+                        Math.sin(
+                            phase * 6.283185
+                        );
 
-function playTone(
-    n,
-    d,
-    vel,
-    ch,
-    inst,
-    tr,
-    targetTime
-){
+                    sample =
+                        noise * 0.55 +
+                        kick * 0.45;
 
-    if(!audioCtx){
-        return;
-    }
+                }else{
 
+                    /*
+                     * 基本波
+                     */
 
-    /*
-        targetTimeはMIDI上の秒数。
-        startTimeを足してAudioContext時間へ。
-    */
+                    const p =
+                        phase -
+                        Math.floor(phase);
 
-    const playTime =
-        targetTime +
-        startTime;
 
+                    if(voice.inst.wave === 0){
 
-    /*
-        過去に入ってしまった音は無視。
-    */
+                        sample =
+                            Math.sin(
+                                2 * Math.PI * p
+                            );
 
-    if(
-        playTime <
-        audioCtx.currentTime - 0.01
-    ){
-        return;
-    }
+                    }else if(
+                        voice.inst.wave === 1
+                    ){
 
+                        sample =
+                            2*p - 1;
 
-    /*
-        同じチャンネル・音程の
-        極端な連打だけ間引く。
+                    }else if(
+                        voice.inst.wave === 2
+                    ){
 
-        BlackMIDIでは非常に重要。
-    */
+                        sample =
+                            p < 0.5 ? 1 : -1;
 
-    const key =
-        ch * 128 + n;
+                    }else{
 
-    if(
-        targetTime -
-        lastPlayTimes[key]
-        < 0.018
-    ){
+                        sample =
+                            1 -
+                            4 *
+                            Math.abs(
+                                Math.round(p)-p
+                            );
+                    }
 
-        return;
-    }
 
-    lastPlayTimes[key] =
-        targetTime;
+                    /*
+                     * 倍音
+                     *
+                     * 「電子ブザー」っぽくならない
+                     * ように軽く混ぜる。
+                     */
 
+                    sample =
+                        sample * 0.72 +
 
-    /*
-        古いVoiceを掃除。
-    */
+                        Math.sin(
+                            2*Math.PI*p*2
+                        ) *
+                        voice.inst.harmonic *
+                        0.18 +
 
-    cleanVoices();
+                        Math.sin(
+                            2*Math.PI*p*3
+                        ) *
+                        voice.inst.harmonic *
+                        0.07;
+                }
 
 
-    /*
-        最大発音数。
-    */
+                /*
+                 * velocity + envelope
+                 */
 
-    if(
-        activeVoices.length >=
-        MAX_VOICES
-    ){
+                let amp =
+                    voice.velocity *
+                    env *
+                    0.12;
 
-        const oldest =
-            activeVoices.shift();
 
-        stopVoice(oldest);
-    }
+                /*
+                 * 高音を少し抑える
+                 */
 
+                const highCut =
+                    1 /
+                    (
+                        1 +
+                        Math.max(
+                            0,
+                            voice.freq - 1200
+                        ) / 8000
+                    );
 
-    /* =====================================================
-       音量
-    ===================================================== */
 
-    let trackWeight = 0.05;
+                amp *= highCut;
 
-    if(
-        tr <= 2
-    ){
-        trackWeight = 0.16;
-    }
 
-    /*
-        極端に大量の音が重なると
-        コンプレッサーだけでは厳しいため
-        少し余裕を持たせる。
-    */
+                /*
+                 * Pan
+                 */
 
-    const vol =
-        (
-            vel / 127
-        ) *
-        trackWeight;
+                const pan =
+                    voice.pan;
 
+                const lGain =
+                    Math.cos(
+                        (pan+1) *
+                        Math.PI / 4
+                    );
 
-    /* =====================================================
-       ドラム
-    ===================================================== */
+                const rGain =
+                    Math.sin(
+                        (pan+1) *
+                        Math.PI / 4
+                    );
 
-    if(ch === 9){
 
-        const osc =
-            audioCtx.createOscillator();
+                L +=
+                    sample *
+                    amp *
+                    lGain;
 
-        const gain =
-            audioCtx.createGain();
+                R +=
+                    sample *
+                    amp *
+                    rGain;
 
 
-        const isKick =
-            n === 35 ||
-            n === 36;
+                /*
+                 * 位相更新
+                 */
 
+                voice.phase +=
+                    f / sampleRate;
 
-        osc.type =
-            'triangle';
+                if(voice.phase >= 1){
+                    voice.phase -= 1;
+                }
+            }
 
 
-        if(isKick){
+            /*
+             * 軽いソフトクリップ
+             */
 
-            osc.frequency.setValueAtTime(
-                110,
-                playTime
-            );
+            left[i] =
+                Math.tanh(L);
 
-            osc.frequency.exponentialRampToValueAtTime(
-                45,
-                playTime + 0.06
-            );
-
-        }else{
-
-            osc.frequency.setValueAtTime(
-                5000,
-                playTime
-            );
+            right[i] =
+                Math.tanh(R);
         }
 
 
-        gain.gain.setValueAtTime(
-            vol * 0.9,
-            playTime
-        );
+        currentFrame++;
 
-        gain.gain.exponentialRampToValueAtTime(
-            0.001,
-            playTime + (
-                isKick ? 0.08 : 0.035
-            )
-        );
+        return true;
+    }
+}
 
+let currentFrame = 0;
 
-        osc.connect(gain);
-        gain.connect(mainGain);
+registerProcessor(
+    "blackmidi-synth",
+    BlackMIDIProcessor
+);
+`;
 
 
-        const end =
-            playTime +
-            (
-                isKick
-                    ? 0.09
-                    : 0.045
-            );
+/* =========================================================
+   AudioWorklet初期化
+========================================================= */
 
+async function initAudio(){
 
-        osc.start(playTime);
-        osc.stop(end);
-
-
-        activeVoices.push({
-            osc:osc,
-            gain:gain,
-            end:end
-        });
-
+    if(audioCtx && audioWorkletNode){
         return;
     }
 
 
-    /* =====================================================
-       通常音
-    ===================================================== */
+    audioCtx =
+        new (
+            window.AudioContext ||
+            window.webkitAudioContext
+        )();
 
-    const osc =
-        audioCtx.createOscillator();
 
-    const gain =
+    /*
+     * BlobからAudioWorkletを作る。
+     */
+
+    const blob =
+        new Blob(
+            [workletCode],
+            {
+                type:"application/javascript"
+            }
+        );
+
+
+    const url =
+        URL.createObjectURL(blob);
+
+
+    await audioCtx.audioWorklet.addModule(url);
+
+    URL.revokeObjectURL(url);
+
+
+    audioWorkletNode =
+        new AudioWorkletNode(
+            audioCtx,
+            "blackmidi-synth",
+            {
+                numberOfInputs:0,
+                numberOfOutputs:1,
+                outputChannelCount:[2]
+            }
+        );
+
+
+    masterGain =
         audioCtx.createGain();
 
-
-    const freq =
-        noteFrequency(n);
-
-
-    osc.frequency.setValueAtTime(
-        freq,
-        playTime
-    );
-
-
-    osc.type =
-        getWaveform(inst);
+    masterGain.gain.value =
+        0.8;
 
 
     /*
-        軽量化のため
-        元コードの「追加Attack Oscillator」は削除。
+     * 音量を急に切らない。
+     */
 
-        ここが大量BlackMIDIではかなり効く。
-        1音 = Oscillator 1個。
-    */
-
-
-    gain.gain.setValueAtTime(
-        0.0001,
-        playTime
+    audioWorkletNode.connect(
+        masterGain
     );
 
-
-    gain.gain.linearRampToValueAtTime(
-        vol,
-        playTime + 0.003
+    masterGain.connect(
+        audioCtx.destination
     );
-
-
-    /*
-        dが0や極端に短い場合にも
-        AudioParamエラーを出さない。
-    */
-
-    const safeDuration =
-        Math.max(
-            0.008,
-            d
-        );
-
-
-    let releaseTime;
-
-
-    if(
-        getWaveform(inst) ===
-        'sine'
-    ){
-
-        /*
-            ピアノ系
-        */
-
-        const sustainVolume =
-            Math.max(
-                0.0001,
-                vol * 0.25
-            );
-
-
-        const decayTime =
-            Math.min(
-                safeDuration,
-                2.5
-            );
-
-
-        releaseTime =
-            playTime +
-            safeDuration +
-            0.04;
-
-
-        gain.gain.exponentialRampToValueAtTime(
-            sustainVolume,
-            playTime + decayTime
-        );
-
-        gain.gain.setValueAtTime(
-            sustainVolume,
-            playTime + safeDuration
-        );
-
-    }else{
-
-        /*
-            ストリングス等
-        */
-
-        releaseTime =
-            playTime +
-            safeDuration +
-            0.025;
-
-
-        gain.gain.setValueAtTime(
-            Math.max(
-                0.0001,
-                vol
-            ),
-            playTime +
-            Math.max(
-                0,
-                safeDuration - 0.008
-            )
-        );
-    }
-
-
-    gain.gain.linearRampToValueAtTime(
-        0.0001,
-        releaseTime
-    );
-
-
-    osc.connect(gain);
-
-    gain.connect(mainGain);
-
-
-    osc.start(playTime);
-
-    osc.stop(
-        releaseTime + 0.01
-    );
-
-
-    activeVoices.push({
-        osc:osc,
-        gain:gain,
-        end:releaseTime + 0.02
-    });
 }
 
 
 /* =========================================================
-   VLQ
+   MIDI Parser
 ========================================================= */
 
-function readVLQ(v, o){
+function readU16(data,pos){
 
-    let val = 0;
-    let idx = 0;
+    return (
+        (data[pos] << 8) |
+        data[pos+1]
+    );
+}
 
-    while(
-        idx < 4 &&
-        o + idx < v.byteLength
-    ){
 
-        const b =
-            v.getUint8(
-                o + idx
-            );
+function readU32(data,pos){
 
-        idx++;
+    return (
+        data[pos] * 16777216 +
+        data[pos+1] * 65536 +
+        data[pos+2] * 256 +
+        data[pos+3]
+    );
+}
 
-        val =
-            (
-                val << 7
-            ) |
-            (
-                b & 127
-            );
 
-        if(
-            !(b & 128)
-        ){
+function readVLQ(data,pos){
+
+    let value = 0;
+    let count = 0;
+
+    while(pos < data.length && count < 4){
+
+        const b = data[pos++];
+
+        value =
+            (value << 7) |
+            (b & 0x7f);
+
+        count++;
+
+        if(!(b & 0x80)){
             break;
         }
     }
 
     return {
-        val:val,
-        idx:idx
+        value:value,
+        pos:pos
     };
 }
 
@@ -996,777 +1050,628 @@ function readVLQ(v, o){
    MIDI解析
 ========================================================= */
 
-function parseMIDI(buf){
+function parseMIDI(buffer){
 
-    const v =
-        new DataView(buf);
+    const data =
+        new Uint8Array(buffer);
+
+
+    let pos = 0;
 
 
     if(
-        v.byteLength < 14
+        data[0] !== 0x4d ||
+        data[1] !== 0x54 ||
+        data[2] !== 0x68 ||
+        data[3] !== 0x64
     ){
+
         throw new Error(
-            "MIDIファイルが短すぎます"
+            "MIDIヘッダーが見つかりません"
         );
     }
 
 
-    /*
-        MThd
-    */
-
-    if(
-        v.getUint32(0) !==
-        0x4D546864
-    ){
-
-        throw new Error(
-            "無効なMIDIファイルです"
-        );
-    }
-
-
-    const hLen =
-        v.getUint32(4);
+    const headerLength =
+        readU32(data,4);
 
     const format =
-        v.getUint16(8);
+        readU16(data,8);
 
-    const tCnt =
-        v.getUint16(10);
+    const trackCount =
+        readU16(data,10);
 
-    const tDiv =
-        v.getUint16(12);
+    const division =
+        readU16(data,12);
 
 
-    if(
-        tDiv & 0x8000
-    ){
+    pos =
+        8 + headerLength;
 
-        throw new Error(
-            "SMPTE形式には未対応です"
-        );
+
+    let ppqn;
+
+    if(division & 0x8000){
+
+        /*
+         * SMPTE。
+         * 普通のMIDIより少ないので
+         * ここでは安全側に処理。
+         */
+
+        const fps =
+            256 -
+            ((division >> 8) & 0xff);
+
+        const ticksPerFrame =
+            division & 0xff;
+
+        ppqn =
+            Math.max(
+                1,
+                fps * ticksPerFrame
+            );
+
+    }else{
+
+        ppqn =
+            division & 0x7fff;
     }
 
 
+    const allEvents = [];
+
+    let globalOrder = 0;
+
+
     /*
-        トラック位置
-    */
-
-    let off =
-        8 + hLen;
-
-
-    const trackOffsets = [];
-    const trackEnds = [];
-
+     * 各トラック解析
+     */
 
     for(
-        let t = 0;
-        t < tCnt;
-        t++
+        let track=0;
+        track<trackCount;
+        track++
     ){
 
-        if(
-            off + 8 >
-            v.byteLength
-        ){
+        if(pos + 8 > data.length){
             break;
         }
 
 
         if(
-            v.getUint32(off) !==
-            0x4D54726B
+            data[pos] !== 0x4d ||
+            data[pos+1] !== 0x54 ||
+            data[pos+2] !== 0x72 ||
+            data[pos+3] !== 0x6b
         ){
 
-            const badLen =
-                v.getUint32(
-                    off + 4
-                );
-
-            off +=
-                8 + badLen;
-
-            continue;
+            throw new Error(
+                "MTrkが見つかりません"
+            );
         }
 
 
-        const tLen =
-            v.getUint32(
-                off + 4
-            );
+        const trackLength =
+            readU32(data,pos+4);
+
+        pos += 8;
 
 
-        const start =
-            off + 8;
-
-        const end =
+        const trackEnd =
             Math.min(
-                start + tLen,
-                v.byteLength
+                data.length,
+                pos + trackLength
             );
 
 
-        trackOffsets.push(start);
-        trackEnds.push(end);
-
-
-        off =
-            start + tLen;
-    }
-
-
-    /* =====================================================
-       Tempo
-    ===================================================== */
-
-    const tempoEvents = [];
-
-
-    /* =====================================================
-       生ノート
-    ===================================================== */
-
-    const allNotesRaw = [];
-
-
-    /* =====================================================
-       Track解析
-    ===================================================== */
-
-    for(
-        let t = 0;
-        t < trackOffsets.length;
-        t++
-    ){
-
-        let tOff =
-            trackOffsets[t];
-
-        const tEnd =
-            trackEnds[t];
-
-
-        let currentTick = 0;
-
-        let rStat = 0;
-
+        let tick = 0;
+        let runningStatus = 0;
 
         /*
-            プログラムはチャンネル別。
-        */
-
+         * MIDI Program
+         */
         const programs =
             new Uint8Array(16);
 
 
         /*
-            同じ音程の重複ノートに対応。
-
-            act[key] = 配列
-        */
-
-        const act =
-            new Map();
+         * note-onのスタック
+         *
+         * 同じ音程が重なるMIDIにも対応。
+         */
+        const active = new Map();
 
 
-        while(
-            tOff < tEnd
-        ){
+        while(pos < trackEnd){
 
             const vlq =
-                readVLQ(
-                    v,
-                    tOff
-                );
+                readVLQ(data,pos);
+
+            tick += vlq.value;
+            pos = vlq.pos;
 
 
-            tOff +=
-                vlq.idx;
+            let status =
+                data[pos];
 
 
-            currentTick +=
-                vlq.val;
+            if(status < 0x80){
 
+                if(!runningStatus){
 
-            if(
-                tOff >= tEnd
-            ){
-                break;
-            }
-
-
-            let stat =
-                v.getUint8(tOff);
-
-
-            /*
-                Running Status
-            */
-
-            if(
-                stat & 128
-            ){
-
-                tOff++;
-
-                /*
-                    Channel Messageのみ
-                    running statusとして保存。
-                */
-
-                if(
-                    stat >= 0x80 &&
-                    stat <= 0xEF
-                ){
-
-                    rStat =
-                        stat;
+                    pos++;
+                    continue;
                 }
+
+                status =
+                    runningStatus;
 
             }else{
 
-                if(
-                    !rStat
-                ){
-                    break;
-                }
+                pos++;
 
-                stat =
-                    rStat;
+                if(
+                    status >= 0x80 &&
+                    status <= 0xef
+                ){
+
+                    runningStatus =
+                        status;
+                }
             }
 
 
-            /* =================================================
-               META
-            ================================================= */
+            /*
+             * Meta
+             */
 
-            if(
-                stat === 0xFF
-            ){
+            if(status === 0xff){
 
-                if(
-                    tOff >= tEnd
-                ){
+                if(pos >= trackEnd){
+                    break;
+                }
+
+                const type =
+                    data[pos++];
+
+                const lenInfo =
+                    readVLQ(data,pos);
+
+                const len =
+                    lenInfo.value;
+
+                pos =
+                    lenInfo.pos;
+
+
+                if(type === 0x51 && len === 3){
+
+                    const usPerBeat =
+                        data[pos] * 65536 +
+                        data[pos+1] * 256 +
+                        data[pos+2];
+
+
+                    allEvents.push({
+                        type:"tempo",
+                        tick:tick,
+                        tempo:usPerBeat,
+                        order:globalOrder++
+                    });
+                }
+
+
+                if(type === 0x2f){
+
+                    pos += len;
                     break;
                 }
 
 
-                const metaType =
-                    v.getUint8(
-                        tOff++
-                    );
-
-
-                const mV =
-                    readVLQ(
-                        v,
-                        tOff
-                    );
-
-
-                tOff +=
-                    mV.idx;
-
-
-                const metaLen =
-                    mV.val;
-
-
-                if(
-                    metaType === 0x51 &&
-                    metaLen >= 3 &&
-                    tOff + 3 <= tEnd
-                ){
-
-                    const u1 =
-                        v.getUint8(tOff);
-
-                    const u2 =
-                        v.getUint8(tOff + 1);
-
-                    const u3 =
-                        v.getUint8(tOff + 2);
-
-
-                    const mpb =
-                        (
-                            u1 << 16
-                        ) |
-                        (
-                            u2 << 8
-                        ) |
-                        u3;
-
-
-                    if(
-                        mpb > 0
-                    ){
-
-                        tempoEvents.push({
-                            tick:currentTick,
-                            bpm:
-                                60000000 /
-                                mpb
-                        });
-                    }
-                }
-
-
-                tOff +=
-                    metaLen;
-
-                continue;
-            }
-
-
-            /* =================================================
-               SYSEX
-            ================================================= */
-
-            if(
-                stat === 0xF0 ||
-                stat === 0xF7
-            ){
-
-                const sV =
-                    readVLQ(
-                        v,
-                        tOff
-                    );
-
-
-                tOff +=
-                    sV.idx +
-                    sV.val;
+                pos += len;
 
                 continue;
             }
 
 
             /*
-                Channel Messageでなければ無視
-            */
+             * SysEx
+             */
 
             if(
-                stat < 0x80 ||
-                stat > 0xEF
-            ){
-                continue;
-            }
-
-
-            const mType =
-                stat & 0xF0;
-
-            const ch =
-                stat & 15;
-
-
-            /* =================================================
-               Program Change
-            ================================================= */
-
-            if(
-                mType === 0xC0
+                status === 0xf0 ||
+                status === 0xf7
             ){
 
-                if(
-                    tOff < tEnd
-                ){
+                const lenInfo =
+                    readVLQ(data,pos);
 
-                    programs[ch] =
-                        v.getUint8(
-                            tOff++
-                        );
-                }
-
-                continue;
-            }
-
-
-            /* =================================================
-               Channel Pressure
-            ================================================= */
-
-            if(
-                mType === 0xD0
-            ){
-
-                tOff++;
+                pos =
+                    lenInfo.pos +
+                    lenInfo.value;
 
                 continue;
             }
 
 
             /*
-                2byte data
-            */
+             * チャンネルイベント
+             */
 
-            if(
-                tOff + 1 >= tEnd
-            ){
+            const command =
+                status & 0xf0;
+
+            const channel =
+                status & 0x0f;
+
+
+            let a = 0;
+            let b = 0;
+
+
+            if(command === 0xc0){
+
+                if(pos >= trackEnd){
+                    break;
+                }
+
+                programs[channel] =
+                    data[pos++];
+
+                continue;
+            }
+
+
+            if(command === 0xd0){
+
+                pos++;
+
+                continue;
+            }
+
+
+            if(pos >= trackEnd){
                 break;
             }
 
 
-            const n =
-                v.getUint8(
-                    tOff++
-                );
-
-            const vel =
-                v.getUint8(
-                    tOff++
-                );
-
-
-            /* =================================================
-               NOTE ON
-            ================================================= */
+            a = data[pos++];
 
             if(
-                mType === 0x90 &&
-                vel > 0
+                command !== 0xd0 &&
+                command !== 0xc0
             ){
 
-                const key =
-                    ch * 128 + n;
-
-
-                let stack =
-                    act.get(key);
-
-
-                if(
-                    !stack
-                ){
-
-                    stack = [];
-
-                    act.set(
-                        key,
-                        stack
-                    );
+                if(pos >= trackEnd){
+                    break;
                 }
 
-
-                stack.push({
-                    tick:currentTick,
-                    v:vel,
-                    i:programs[ch],
-                    c:ch
-                });
-
-
-                continue;
+                b = data[pos++];
             }
 
 
-            /* =================================================
-               NOTE OFF
-            ================================================= */
+            /*
+             * Note On
+             */
 
             if(
-                mType === 0x80 ||
+                command === 0x90 &&
+                b > 0
+            ){
+
+                const key =
+                    channel + ":" + a;
+
+
+                let arr =
+                    active.get(key);
+
+
+                if(!arr){
+
+                    arr = [];
+                    active.set(key,arr);
+                }
+
+
+                arr.push({
+                    tick:tick,
+                    velocity:b,
+                    channel:channel,
+                    program:programs[channel]
+                });
+
+            /*
+             * Note Off
+             */
+
+            }else if(
+                command === 0x80 ||
                 (
-                    mType === 0x90 &&
-                    vel === 0
+                    command === 0x90 &&
+                    b === 0
                 )
             ){
 
                 const key =
-                    ch * 128 + n;
+                    channel + ":" + a;
 
 
-                const stack =
-                    act.get(key);
+                const arr =
+                    active.get(key);
 
 
                 if(
-                    stack &&
-                    stack.length
+                    arr &&
+                    arr.length
                 ){
 
-                    /*
-                        最新のNote Onを閉じる。
-                    */
-
-                    const a =
-                        stack.pop();
+                    const on =
+                        arr.pop();
 
 
-                    const durTick =
-                        currentTick -
-                        a.tick;
+                    const length =
+                        Math.max(
+                            1,
+                            tick - on.tick
+                        );
 
 
-                    if(
-                        durTick > 0
-                    ){
-
-                        allNotesRaw.push({
-                            m:n,
-                            startTick:a.tick,
-                            endTick:currentTick,
-                            v:a.v,
-                            i:a.i,
-                            ch:a.c,
-                            tr:t
-                        });
-                    }
+                    allEvents.push({
+                        type:"note",
+                        tick:on.tick,
+                        endTick:tick,
+                        durationTicks:length,
+                        note:a,
+                        velocity:on.velocity,
+                        channel:on.channel,
+                        program:on.program,
+                        order:globalOrder++
+                    });
                 }
-
-
-                continue;
             }
-
-
-            /*
-                CC / Pitch Bendなど
-                再生に不要なイベントは
-                巨大配列へ保存しない。
-
-                これが軽量化にかなり効く。
-            */
         }
+
+
+        /*
+         * 終端まで残ったノートは無視。
+         * 壊れたMIDIで異常に長い音を作らない。
+         */
+
+        pos =
+            trackEnd;
     }
 
 
-    /* =====================================================
-       Tempoを整理
-    ===================================================== */
-
-    tempoEvents.sort(
-        (a,b) =>
-            a.tick -
-            b.tick
-    );
-
-
     /*
-        元コードの
+     * テンポがない場合は120BPM
+     */
 
-            tempoEvents.tick > 0
+    const tempos =
+        allEvents
+            .filter(e => e.type === "tempo")
+            .sort(
+                (a,b)=>
+                    a.tick-b.tick ||
+                    a.order-b.order
+            );
 
-        は配列に対してtickを読んでいたため
-        常にundefinedになっていました。
-
-        tempoEvents[0]を正しく確認。
-    */
 
     if(
-        tempoEvents.length === 0 ||
-        tempoEvents[0].tick > 0
+        !tempos.length ||
+        tempos[0].tick !== 0
     ){
 
-        tempoEvents.unshift({
+        tempos.unshift({
+            type:"tempo",
             tick:0,
-            bpm:120
+            tempo:500000,
+            order:-1
         });
     }
 
 
     /*
-        同一tickのTempoをまとめる。
-    */
+     * 同一tickのテンポを整理
+     */
 
-    const tempos = [];
+    const tempoMap = [];
 
+    let currentTempo =
+        500000;
 
-    for(
-        let i = 0;
-        i < tempoEvents.length;
-        i++
-    ){
-
-        const e =
-            tempoEvents[i];
+    let previousTick = 0;
+    let previousTime = 0;
 
 
-        if(
-            tempos.length &&
-            tempos[
-                tempos.length - 1
-            ].tick === e.tick
-        ){
+    for(const t of tempos){
 
-            tempos[
-                tempos.length - 1
-            ].bpm =
-                e.bpm;
-
-        }else{
-
-            tempos.push({
-                tick:e.tick,
-                bpm:e.bpm,
-                sec:0
-            });
+        if(t.tick < previousTick){
+            continue;
         }
-    }
 
 
-    /* =====================================================
-       Tempo Map
-    ===================================================== */
-
-    for(
-        let i = 1;
-        i < tempos.length;
-        i++
-    ){
-
-        const prev =
-            tempos[i - 1];
-
-        const cur =
-            tempos[i];
-
-
-        cur.sec =
-            prev.sec +
+        previousTime +=
             (
-                cur.tick -
-                prev.tick
+                t.tick -
+                previousTick
             ) *
-            (
-                60 /
-                (
-                    prev.bpm *
-                    tDiv
-                )
-            );
+            currentTempo /
+            1000000 /
+            ppqn;
+
+
+        currentTempo =
+            t.tempo;
+
+
+        tempoMap.push({
+            tick:t.tick,
+            time:previousTime,
+            tempo:currentTempo
+        });
+
+
+        previousTick =
+            t.tick;
     }
 
 
-    /* =====================================================
-       Tick -> 秒
-    ===================================================== */
+    /*
+     * tick → seconds
+     */
 
-    function tickToSecond(tick){
+    function tickToSeconds(tick){
 
-        let low = 0;
+        let lo = 0;
+        let hi =
+            tempoMap.length - 1;
 
-        let high =
-            tempos.length - 1;
+        let index = 0;
 
 
-        /*
-            二分探索。
-
-            元コードでは毎ノートごとに
-            Tempo Map全体を最初から走査していた。
-
-            BlackMIDIではここがかなり重くなる。
-        */
-
-        while(
-            low < high
-        ){
+        while(lo <= hi){
 
             const mid =
-                (
-                    low +
-                    high +
-                    1
-                ) >> 1;
+                (lo + hi) >> 1;
 
 
             if(
-                tempos[mid].tick <= tick
+                tempoMap[mid].tick <= tick
             ){
 
-                low =
-                    mid;
+                index = mid;
+                lo = mid + 1;
 
             }else{
 
-                high =
-                    mid - 1;
+                hi = mid - 1;
             }
         }
 
 
-        const tempo =
-            tempos[low];
+        const base =
+            tempoMap[index];
 
 
         return (
-            tempo.sec +
+            base.time +
             (
                 tick -
-                tempo.tick
+                base.tick
             ) *
-            (
-                60 /
-                (
-                    tempo.bpm *
-                    tDiv
-                )
-            )
+            base.tempo /
+            1000000 /
+            ppqn
         );
     }
 
 
-    /* =====================================================
-       秒に変換
-    ===================================================== */
+    /*
+     * ノートだけ取り出す
+     */
 
-    const finalNotes =
-        new Array(
-            allNotesRaw.length
-        );
-
-
-    for(
-        let i = 0;
-        i < allNotesRaw.length;
-        i++
-    ){
-
-        const n =
-            allNotesRaw[i];
-
-
-        const tSec =
-            tickToSecond(
-                n.startTick
+    const parsed =
+        allEvents
+            .filter(
+                e =>
+                    e.type === "note"
             );
 
 
-        const eSec =
-            tickToSecond(
+    /*
+     * 時間変換
+     */
+
+    for(const n of parsed){
+
+        n.t =
+            tickToSeconds(
+                n.tick
+            );
+
+        n.endTime =
+            tickToSeconds(
                 n.endTick
             );
 
-
-        finalNotes[i] = {
-            m:n.m,
-            t:tSec,
-            d:Math.max(
-                0.001,
-                eSec - tSec
-            ),
-            v:n.v,
-            i:n.i,
-            ch:n.ch,
-            tr:n.tr,
-            p:false
-        };
+        n.d =
+            Math.max(
+                0.008,
+                n.endTime - n.t
+            );
     }
 
 
-    return finalNotes;
+    /*
+     * 開始時間順
+     */
+
+    parsed.sort(
+        (a,b)=>
+            a.t-b.t ||
+            a.note-b.note
+    );
+
+
+    /*
+     * パン。
+     *
+     * MIDI標準のCCパンを完全実装する代わりに、
+     * チャンネル位置を軽く散らす。
+     */
+
+    for(const n of parsed){
+
+        if(n.channel === 9){
+
+            n.pan = 0;
+
+        }else{
+
+            n.pan =
+                (
+                    (n.channel % 7) - 3
+                ) / 12;
+        }
+    }
+
+
+    notes = parsed;
+
+
+    /*
+     * duration
+     */
+
+    cachedDuration = 0;
+
+    if(notes.length){
+
+        let max =
+            notes[notes.length-1].endTime;
+
+        cachedDuration =
+            Math.max(
+                0.1,
+                max
+            );
+    }
+
+
+    duration =
+        cachedDuration;
+
+
+    return {
+        format,
+        trackCount,
+        ppqn,
+        notes:parsed,
+        duration:cachedDuration
+    };
 }
-
-
-/* =========================================================
-   発音ポインタ
-========================================================= */
-
-let audioPlaybackPointer = 0;
 
 
 /* =========================================================
@@ -1774,116 +1679,59 @@ let audioPlaybackPointer = 0;
 ========================================================= */
 
 fInp.addEventListener(
-    'change',
-    async (e) => {
+    "change",
+    async function(){
 
-        const fs =
-            e.target.files;
+        const file =
+            this.files[0];
 
-
-        if(
-            !fs ||
-            fs.length === 0
-        ){
+        if(!file){
             return;
         }
 
 
-        const file =
-            fs.item(0);
-
-
-        showLog(
-            "高速BlackMIDI解析中...: " +
-            file.name
-        );
-
-
-        initAudioEngine();
-
-
         try{
 
-            const buf =
+            stopPlayback();
+
+
+            log(
+                "読み込み中..."
+            );
+
+
+            const buffer =
                 await file.arrayBuffer();
 
 
-            /*
-                巨大ファイルの場合、
-                ファイル読み込み直後に一度ブラウザへ
-               処理を返す。
-            */
-
-            await new Promise(
-                resolve =>
-                    setTimeout(
-                        resolve,
-                        0
-                    )
-            );
+            const result =
+                parseMIDI(buffer);
 
 
-            notes =
-                parseMIDI(buf);
-
-
-            /*
-                時間順。
-
-                parserは基本的にtrack順なので
-                最後に全体を並べる。
-            */
-
-            notes.sort(
-                (a,b) =>
-                    a.t - b.t
-            );
-
-
-            isPlaying =
-                false;
-
-
-            pauseTime =
-                0;
-
-
-            audioPlaybackPointer =
-                0;
-
-
-            lastPlayTimes.fill(
-                -999
-            );
+            currentFileName =
+                file.name;
 
 
             pBtn.style.display =
-                'block';
+                "block";
 
 
             pBtn.textContent =
-                '▶ 再生';
+                "▶ 再生";
 
 
-            showLog(
-                "読み込み成功! 総ノーツ数: " +
-                notes.length.toLocaleString()
+            isPaused = false;
+            pauseTime = 0;
+
+
+            log(
+                file.name +
+                " / " +
+                result.notes.length.toLocaleString() +
+                "音符 / " +
+                result.duration.toFixed(2) +
+                "秒"
             );
-
-
-            /*
-                pフラグ初期化。
-            */
-
-            for(
-                let i = 0;
-                i < notes.length;
-                i++
-            ){
-
-                notes[i].p =
-                    false;
-            }
 
 
             draw(0);
@@ -1893,9 +1741,8 @@ fInp.addEventListener(
 
             console.error(err);
 
-
-            showLog(
-                "失敗: " +
+            log(
+                "エラー: " +
                 err.message
             );
         }
@@ -1904,161 +1751,65 @@ fInp.addEventListener(
 
 
 /* =========================================================
-   再生 / 一時停止
+   音声スケジューラ
 ========================================================= */
 
-pBtn.addEventListener(
-    'click',
-    () => {
+function getPlaybackTime(){
 
-        initAudioEngine();
-
-
-        if(
-            isPlaying
-        ){
-
-            /*
-                現在位置を保存。
-            */
-
-            pauseTime =
-                audioCtx.currentTime -
-                startTime;
-
-
-            isPlaying =
-                false;
-
-
-            pBtn.textContent =
-                '▶ 再生';
-
-
-            showLog(
-                "一時停止"
-            );
-
-
-            /*
-                現在鳴っている音を
-                即座に大量停止せず、
-                短く消す。
-            */
-
-            fadeOutAllVoices();
-
-
-        }else{
-
-            /*
-                曲末なら最初から。
-            */
-
-            if(
-                notes.length &&
-                pauseTime >=
-                getDuration()
-            ){
-
-                pauseTime = 0;
-
-                audioPlaybackPointer = 0;
-
-                for(
-                    let i = 0;
-                    i < notes.length;
-                    i++
-                ){
-
-                    notes[i].p =
-                        false;
-                }
-            }
-
-
-            isPlaying =
-                true;
-
-
-            startTime =
-                audioCtx.currentTime -
-                pauseTime;
-
-
-            pBtn.textContent =
-                '再生中...';
-
-
-            showLog(
-                "再生中"
-            );
-
-
-            animate();
-        }
-    }
-);
-
-
-/* =========================================================
-   曲の長さ
-========================================================= */
-
-let cachedDuration = 0;
-
-
-function getDuration(){
-
-    if(
-        cachedDuration > 0
-    ){
-        return cachedDuration;
+    if(!audioCtx){
+        return 0;
     }
 
-
-    let max =
-        0;
-
-
-    /*
-        spread禁止。
-    */
-
-    for(
-        let i = 0;
-        i < notes.length;
-        i++
-    ){
-
-        const end =
-            notes[i].t +
-            notes[i].d;
-
-
-        if(
-            end > max
-        ){
-            max = end;
-        }
-    }
-
-
-    cachedDuration =
-        max;
-
-
-    return max;
+    return Math.max(
+        0,
+        audioCtx.currentTime -
+        startTime
+    );
 }
 
 
-/* =========================================================
-   全Voiceフェードアウト
-========================================================= */
-
-function fadeOutAllVoices(){
+function sendNoteToWorklet(n){
 
     if(
+        !audioWorkletNode ||
+        !audioCtx
+    ){
+        return;
+    }
+
+
+    audioWorkletNode.port.postMessage({
+
+        type:"note",
+
+        note:n.note,
+
+        velocity:n.velocity,
+
+        program:n.program,
+
+        channel:n.channel,
+
+        pan:n.pan,
+
+        duration:n.d
+    });
+}
+
+
+/*
+ * 音声スケジューラ。
+ *
+ * 描画とは完全に別。
+ *
+ * 25msごとに150ms先まで送る。
+ */
+
+function scheduleAudio(){
+
+    if(
+        !isPlaying ||
+        isPaused ||
         !audioCtx
     ){
         return;
@@ -2066,264 +1817,346 @@ function fadeOutAllVoices(){
 
 
     const now =
-        audioCtx.currentTime;
+        getPlaybackTime();
 
 
-    for(
-        let i = 0;
-        i < activeVoices.length;
-        i++
-    ){
+    const until =
+        now +
+        AUDIO_LOOKAHEAD;
 
-        const v =
-            activeVoices[i];
-
-
-        try{
-
-            v.gain.gain.cancelScheduledValues(
-                now
-            );
-
-            v.gain.gain.setTargetAtTime(
-                0,
-                now,
-                0.006
-            );
-
-            v.osc.stop(
-                now + 0.035
-            );
-
-        }catch(e){}
-    }
-
-
-    activeVoices.length = 0;
-}
-
-
-/* =========================================================
-   再生アニメーション
-========================================================= */
-
-function animate(){
-
-    if(
-        !isPlaying
-    ){
-        return;
-    }
-
-
-    const cTime =
-        audioCtx.currentTime -
-        startTime;
-
-
-    /*
-        少し先まで予約。
-
-        元コードの50msを維持。
-    */
-
-    const lookAheadTime =
-        cTime + 0.05;
-
-
-    /*
-        発音処理。
-
-        一度通過したノートは
-        二度と最初から探さない。
-    */
 
     while(
-        audioPlaybackPointer <
-        notes.length
+        audioPointer < notes.length
     ){
 
         const n =
-            notes[
-                audioPlaybackPointer
-            ];
+            notes[audioPointer];
 
 
-        if(
-            n.t >
-            lookAheadTime
-        ){
-
+        if(n.t > until){
             break;
         }
 
 
-        if(
-            !n.p
+        /*
+         * 既に開始したノートは、
+         * 遅延時に即時再生。
+         */
+
+        if(n.t >= now - 0.02){
+
+            sendNoteToWorklet(n);
+
+        }else if(
+            n.endTime > now
         ){
 
             /*
-                現在時刻より前でも
-                ノート終了前なら鳴らす。
+             * 現在位置に少しだけ食い込んでいる
+             * ノートは残り時間だけ鳴らす。
+             */
 
-                ただし大幅に遅れた場合は
-               鳴らさない。
-            */
+            const copy = {
+                ...n,
+                d:
+                    Math.max(
+                        0.01,
+                        n.endTime - now
+                    )
+            };
 
-            if(
-                n.t + n.d >
-                cTime
-            ){
-
-                playTone(
-                    n.m,
-                    n.d,
-                    n.v,
-                    n.ch,
-                    n.i,
-                    n.tr,
-                    n.t
-                );
-            }
-
-
-            n.p = true;
+            sendNoteToWorklet(copy);
         }
 
 
-        audioPlaybackPointer++;
+        audioPointer++;
     }
+}
 
 
-    cleanVoices();
+/* =========================================================
+   スケジューラ開始
+========================================================= */
+
+function startAudioScheduler(){
+
+    stopAudioScheduler();
+
+
+    audioScheduler =
+        setInterval(
+            scheduleAudio,
+            AUDIO_SCHEDULE_INTERVAL
+        );
 
 
     /*
-        曲終了。
-    */
+     * 最初の一回は即実行
+     */
 
-    const duration =
-        getDuration();
+    scheduleAudio();
+}
 
 
-    if(
-        cTime >= duration
-    ){
+function stopAudioScheduler(){
+
+    if(audioScheduler){
+
+        clearInterval(
+            audioScheduler
+        );
+
+        audioScheduler = null;
+    }
+}
+
+
+/* =========================================================
+   再生
+========================================================= */
+
+async function startPlayback(){
+
+    if(!notes.length){
+        return;
+    }
+
+
+    try{
+
+        await initAudio();
+
 
         if(
-            loopEnabled
+            audioCtx.state ===
+            "suspended"
         ){
 
-            /*
-                ループ。
-            */
+            await audioCtx.resume();
+        }
 
-            fadeOutAllVoices();
+
+        /*
+         * 一時停止からの再開
+         */
+
+        if(isPaused){
+
+            startTime =
+                audioCtx.currentTime -
+                pauseTime;
+
+            isPaused = false;
+
+        }else{
 
             pauseTime = 0;
 
-            audioPlaybackPointer = 0;
+            audioPointer = 0;
 
-
-            for(
-                let i = 0;
-                i < notes.length;
-                i++
-            ){
-
-                notes[i].p =
-                    false;
-            }
+            audioWorkletNode.port.postMessage({
+                type:"clear"
+            });
 
 
             startTime =
                 audioCtx.currentTime;
-
-        }else{
-
-            isPlaying =
-                false;
-
-
-            pauseTime =
-                duration;
-
-
-            pBtn.textContent =
-                '▶ 再生';
-
-
-            showLog(
-                "再生終了"
-            );
-
-
-            draw(duration);
-
-            return;
         }
+
+
+        isPlaying = true;
+
+
+        pBtn.textContent =
+            "⏸ 一時停止";
+
+
+        startAudioScheduler();
+
+
+        log(
+            "再生中: " +
+            currentFileName
+        );
+
+
+        requestAnimationFrame(
+            animate
+        );
+
+
+    }catch(err){
+
+        console.error(err);
+
+        log(
+            "音声初期化エラー: " +
+            err.message
+        );
+    }
+}
+
+
+/* =========================================================
+   一時停止
+========================================================= */
+
+function pausePlayback(){
+
+    if(!isPlaying){
+        return;
     }
 
 
-    draw(cTime);
+    pauseTime =
+        getPlaybackTime();
 
 
-    requestAnimationFrame(
-        animate
+    isPaused = true;
+    isPlaying = false;
+
+
+    stopAudioScheduler();
+
+
+    if(audioWorkletNode){
+
+        audioWorkletNode.port.postMessage({
+            type:"stop"
+        });
+    }
+
+
+    pBtn.textContent =
+        "▶ 再生";
+
+
+    log(
+        "一時停止: " +
+        pauseTime.toFixed(2) +
+        "秒"
     );
 }
 
 
 /* =========================================================
-   二分探索
+   停止
 ========================================================= */
 
-function findFirstVisibleIndex(
-    time
-){
+function stopPlayback(){
 
-    let low = 0;
+    isPlaying = false;
+    isPaused = false;
 
-    let high =
-        notes.length;
+    pauseTime = 0;
 
+    audioPointer = 0;
 
-    while(
-        low < high
-    ){
-
-        const mid =
-            (
-                low +
-                high
-            ) >> 1;
+    stopAudioScheduler();
 
 
-        if(
-            notes[mid].t <
-            time
-        ){
+    if(audioWorkletNode){
 
-            low =
-                mid + 1;
+        audioWorkletNode.port.postMessage({
+            type:"stop"
+        });
+    }
 
-        }else{
 
-            high =
-                mid;
+    if(pBtn){
+
+        if(notes.length){
+
+            pBtn.textContent =
+                "▶ 再生";
         }
     }
 
 
-    return low;
+    draw(0);
 }
+
+
+/* =========================================================
+   再生ボタン
+========================================================= */
+
+pBtn.addEventListener(
+    "click",
+    function(){
+
+        if(isPlaying){
+
+            pausePlayback();
+
+        }else{
+
+            startPlayback();
+        }
+    }
+);
+
+
+/* =========================================================
+   キーボード操作
+========================================================= */
+
+window.addEventListener(
+    "keydown",
+    function(e){
+
+        /*
+         * Space
+         */
+
+        if(
+            e.code === "Space" &&
+            document.activeElement !== fInp
+        ){
+
+            e.preventDefault();
+
+
+            if(isPlaying){
+
+                pausePlayback();
+
+            }else{
+
+                startPlayback();
+            }
+        }
+
+
+        /*
+         * Esc
+         */
+
+        if(e.code === "Escape"){
+
+            stopPlayback();
+        }
+    }
+);
 
 
 /* =========================================================
    描画
 ========================================================= */
 
-function draw(cTime){
+function getColor(note){
+
+    return CLRS[
+        (
+            note.channel +
+            note.program
+        ) %
+        CLRS.length
+    ];
+}
+
+
+function draw(currentTime){
 
     const w =
         window.innerWidth;
@@ -2332,16 +2165,12 @@ function draw(cTime){
         window.innerHeight;
 
 
-    const kW =
-        w / NOTE_CNT;
-
-
     /*
-        背景
-    */
+     * 黒背景
+     */
 
     ctx.fillStyle =
-        '#000000';
+        "#000";
 
     ctx.fillRect(
         0,
@@ -2351,99 +2180,83 @@ function draw(cTime){
     );
 
 
-    if(
-        notes.length === 0
-    ){
+    /*
+     * ピアノ領域
+     */
 
-        drawKeyboard(
-            null,
-            w,
-            h,
-            kW
-        );
+    const keyboardHeight =
+        90;
 
-        return;
+    kyY =
+        h -
+        keyboardHeight;
+
+
+    /*
+     * ノート幅
+     */
+
+    const noteWidth =
+        w / NOTE_CNT;
+
+
+    /*
+     * 表示範囲
+     */
+
+    const visibleTop =
+        currentTime;
+
+
+    const visibleBottom =
+        currentTime +
+        h / SPEED;
+
+
+    /*
+     * 二分探索
+     */
+
+    let lo = 0;
+    let hi =
+        notes.length - 1;
+
+    let startIndex =
+        notes.length;
+
+
+    while(lo <= hi){
+
+        const mid =
+            (lo + hi) >> 1;
+
+
+        if(
+            notes[mid].endTime >=
+            visibleTop
+        ){
+
+            startIndex =
+                mid;
+
+            hi =
+                mid - 1;
+
+        }else{
+
+            lo =
+                mid + 1;
+        }
     }
 
 
-    const viewMinTime =
-        cTime - 2;
-
-
-    const viewMaxTime =
-        cTime +
-        (
-            kyY /
-            SPEED
-        );
-
-
     /*
-        表示開始位置を
-        二分探索。
-    */
-
-    const startIndex =
-        findFirstVisibleIndex(
-            viewMinTime
-        );
-
-
-    /*
-        元コードの
-        colorPathsオブジェクトを廃止。
-
-        8色固定なので
-        配列を最初から作っておく。
-    */
-
-    const paths =
-        new Array(
-            CLRS.length
-        );
-
+     * ノート描画
+     */
 
     for(
-        let i = 0;
-        i < CLRS.length;
-        i++
-    ){
-
-        paths[i] = [];
-    }
-
-
-    const drumPaths = [];
-
-
-    const hitX = [];
-    const hitY = [];
-    const hitW = [];
-    const hitH = [];
-
-
-    /*
-        現在鳴っている鍵盤。
-
-        128個固定配列なので
-        Setを毎フレーム作らない。
-    */
-
-    const active =
-        new Uint8Array(128);
-
-
-    const activeColor =
-        new Array(128);
-
-
-    /*
-        画面に入っているノートだけ描画。
-    */
-
-    for(
-        let i = startIndex;
-        i < notes.length;
+        let i=startIndex;
+        i<notes.length;
         i++
     ){
 
@@ -2451,497 +2264,291 @@ function draw(cTime){
             notes[i];
 
 
-        /*
-            未来すぎるところまで行ったら終了。
-        */
-
-        if(
-            n.t >
-            viewMaxTime
-        ){
-
+        if(n.t > visibleBottom){
             break;
         }
 
 
-        if(
-            n.m < MIN_NOTE ||
-            n.m > MAX_NOTE
-        ){
-
+        if(n.note < MIN_NOTE){
             continue;
         }
 
-
-        const nEnd =
-            n.t + n.d;
-
-
-        if(
-            nEnd <
-            viewMinTime
-        ){
-
+        if(n.note > MAX_NOTE){
             continue;
         }
 
 
         const x =
             (
-                n.m -
+                n.note -
                 MIN_NOTE
             ) *
-            kW;
+            noteWidth;
 
 
         const y =
             kyY -
             (
                 n.t -
-                cTime
+                currentTime
             ) *
             SPEED;
 
 
-        const nH =
-            n.d *
-            SPEED;
-
-
-        const xx =
-            x + 1;
-
-
-        const ww =
+        const height =
             Math.max(
-                1,
-                kW - 2
+                2,
+                n.d * SPEED
             );
-
-
-        /*
-            現在発音中
-        */
-
-        if(
-            cTime >= n.t &&
-            cTime <= nEnd
-        ){
-
-            active[n.m] =
-                1;
-
-
-            activeColor[n.m] =
-                n.ch === 9
-                    ? '#555555'
-                    : CLRS[
-                        n.tr %
-                        CLRS.length
-                    ];
-
-
-            hitX.push(xx);
-            hitY.push(y - nH);
-            hitW.push(ww);
-            hitH.push(nH);
-
-
-        }else{
-
-            if(
-                n.ch === 9
-            ){
-
-                drumPaths.push({
-                    x:xx,
-                    y:y - nH,
-                    w:ww,
-                    h:nH
-                });
-
-            }else{
-
-                paths[
-                    n.tr %
-                    CLRS.length
-                ].push({
-                    x:xx,
-                    y:y - nH,
-                    w:ww,
-                    h:nH
-                });
-            }
-        }
-    }
-
-
-    /*
-        通常ノーツ描画
-    */
-
-    for(
-        let cIdx = 0;
-        cIdx < paths.length;
-        cIdx++
-    ){
-
-        const arr =
-            paths[cIdx];
-
-
-        if(
-            arr.length === 0
-        ){
-            continue;
-        }
 
 
         ctx.fillStyle =
-            CLRS[cIdx];
-
-
-        ctx.beginPath();
-
-
-        for(
-            let i = 0;
-            i < arr.length;
-            i++
-        ){
-
-            const r =
-                arr[i];
-
-
-            ctx.rect(
-                r.x,
-                r.y,
-                r.w,
-                r.h
-            );
-        }
-
-
-        ctx.fill();
-    }
-
-
-    /*
-        ドラム
-    */
-
-    if(
-        drumPaths.length
-    ){
-
-        ctx.fillStyle =
-            '#555555';
-
-
-        ctx.beginPath();
-
-
-        for(
-            let i = 0;
-            i < drumPaths.length;
-            i++
-        ){
-
-            const r =
-                drumPaths[i];
-
-
-            ctx.rect(
-                r.x,
-                r.y,
-                r.w,
-                r.h
-            );
-        }
-
-
-        ctx.fill();
-    }
-
-
-    /*
-        発音中ノート
-    */
-
-    if(
-        hitX.length
-    ){
-
-        ctx.fillStyle =
-            '#ffffff';
-
-
-        ctx.beginPath();
-
-
-        for(
-            let i = 0;
-            i < hitX.length;
-            i++
-        ){
-
-            ctx.rect(
-                hitX[i],
-                hitY[i],
-                hitW[i],
-                hitH[i]
-            );
-        }
-
-
-        ctx.fill();
-    }
-
-
-    /*
-        鍵盤
-    */
-
-    drawKeyboard(
-        active,
-        w,
-        h,
-        kW,
-        activeColor
-    );
-}
-
-
-/* =========================================================
-   鍵盤
-========================================================= */
-
-function drawKeyboard(
-    active,
-    w,
-    h,
-    kW,
-    activeColor
-){
-
-    for(
-        let i = 0;
-        i < NOTE_CNT;
-        i++
-    ){
-
-        const nId =
-            MIN_NOTE + i;
-
-
-        const x =
-            i * kW;
-
-
-        const rem =
-            nId % 12;
-
-
-        const isS =
-            (
-                rem === 1 ||
-                rem === 3 ||
-                rem === 6 ||
-                rem === 8 ||
-                rem === 10
-            );
-
-
-        if(
-            active &&
-            active[nId]
-        ){
-
-            ctx.fillStyle =
-                activeColor[nId] ||
-                '#ffffff';
-
-        }else{
-
-            ctx.fillStyle =
-                isS
-                    ? '#151515'
-                    : '#ffffff';
-        }
+            getColor(n);
 
 
         ctx.fillRect(
-            x,
-            kyY,
-            kW - 1,
-            h - kyY
+            x + 1,
+            y - height,
+            Math.max(
+                1,
+                noteWidth - 2
+            ),
+            height
         );
     }
 
 
     /*
-        鍵盤上端
-    */
+     * 赤い判定ライン
+     */
 
-    ctx.strokeStyle =
-        '#ff0055';
+    ctx.fillStyle =
+        "#ff0000";
 
-    ctx.lineWidth = 2;
-
-
-    ctx.beginPath();
-
-    ctx.moveTo(
+    ctx.fillRect(
         0,
-        kyY
-    );
-
-    ctx.lineTo(
+        kyY,
         w,
-        kyY
+        2
     );
 
-    ctx.stroke();
+
+    /*
+     * ピアノ鍵盤
+     */
+
+    drawKeyboard(
+        w,
+        keyboardHeight,
+        noteWidth
+    );
 }
 
 
 /* =========================================================
-   キーボード操作
+   ピアノ鍵盤
 ========================================================= */
 
-window.addEventListener(
-    'keydown',
-    e => {
+function isBlackKey(note){
 
-        /*
-            入力中なら無視
-        */
+    const x =
+        note % 12;
 
-        if(
-            e.target &&
-            (
-                e.target.tagName ===
-                'INPUT' ||
-                e.target.tagName ===
-                'TEXTAREA'
-            )
-        ){
+    return (
+        x === 1 ||
+        x === 3 ||
+        x === 6 ||
+        x === 8 ||
+        x === 10
+    );
+}
 
-            return;
+
+function drawKeyboard(
+    w,
+    keyboardHeight,
+    noteWidth
+){
+
+    const whiteNotes = [];
+
+
+    for(
+        let n=MIN_NOTE;
+        n<=MAX_NOTE;
+        n++
+    ){
+
+        if(!isBlackKey(n)){
+
+            whiteNotes.push(n);
+        }
+    }
+
+
+    const whiteWidth =
+        w /
+        whiteNotes.length;
+
+
+    /*
+     * 白鍵
+     */
+
+    ctx.fillStyle =
+        "#eeeeee";
+
+
+    for(
+        let i=0;
+        i<whiteNotes.length;
+        i++
+    ){
+
+        ctx.fillRect(
+            i * whiteWidth,
+            kyY,
+            whiteWidth - 1,
+            keyboardHeight
+        );
+    }
+
+
+    /*
+     * 黒鍵
+     */
+
+    ctx.fillStyle =
+        "#111111";
+
+
+    for(
+        let n=MIN_NOTE;
+        n<=MAX_NOTE;
+        n++
+    ){
+
+        if(!isBlackKey(n)){
+            continue;
         }
 
 
         /*
-            Space
-        */
+         * 左側の白鍵数
+         */
 
-        if(
-            e.code === 'Space'
+        let whiteBefore = 0;
+
+
+        for(
+            let p=MIN_NOTE;
+            p<n;
+            p++
         ){
 
-            e.preventDefault();
-
-            if(
-                pBtn.style.display !==
-                'none'
-            ){
-
-                pBtn.click();
+            if(!isBlackKey(p)){
+                whiteBefore++;
             }
         }
 
 
-        /*
-            Esc
-        */
+        const x =
+            whiteBefore *
+            whiteWidth -
+            whiteWidth * 0.3;
 
-        if(
-            e.code === 'Escape'
-        ){
 
-            stopPlayback();
-        }
+        ctx.fillRect(
+            x,
+            kyY,
+            whiteWidth * 0.6,
+            keyboardHeight * 0.62
+        );
     }
-);
-
-
-/* =========================================================
-   停止
-========================================================= */
-
-function stopPlayback(){
-
-    if(
-        !notes.length
-    ){
-        return;
-    }
-
-
-    isPlaying =
-        false;
-
-
-    fadeOutAllVoices();
-
-
-    pauseTime =
-        0;
-
-
-    audioPlaybackPointer =
-        0;
-
-
-    for(
-        let i = 0;
-        i < notes.length;
-        i++
-    ){
-
-        notes[i].p =
-            false;
-    }
-
-
-    pBtn.textContent =
-        '▶ 再生';
-
-
-    showLog(
-        "停止"
-    );
-
-
-    draw(0);
 }
 
 
 /* =========================================================
-   ダブルクリックで停止
+   アニメーション
 ========================================================= */
 
-pBtn.addEventListener(
-    'dblclick',
-    e => {
+let lastDrawTime = 0;
 
-        e.preventDefault();
+function animate(timestamp){
 
-        stopPlayback();
+    if(!isPlaying){
+        return;
     }
-);
+
+
+    /*
+     * 描画FPSを少し抑える。
+     *
+     * 音声は別スレッドなので、
+     * ここを抑えても音声スケジュールには影響しない。
+     */
+
+    if(
+        timestamp -
+        lastDrawTime >= 16
+    ){
+
+        lastDrawTime =
+            timestamp;
+
+
+        const t =
+            getPlaybackTime();
+
+
+        draw(t);
+
+
+        if(
+            t >= duration
+        ){
+
+            stopPlayback();
+
+            log(
+                "再生終了"
+            );
+
+            return;
+        }
+    }
+
+
+    requestAnimationFrame(
+        animate
+    );
+}
 
 
 /* =========================================================
-   初期状態
+   初期表示
 ========================================================= */
 
-showLog(
-    "BlackMIDI対応。ファイルを選択してください。"
+draw(0);
+
+
+/* =========================================================
+   ページ終了時
+========================================================= */
+
+window.addEventListener(
+    "beforeunload",
+    function(){
+
+        stopAudioScheduler();
+
+        if(audioCtx){
+
+            audioCtx.close();
+        }
+    }
 );
 
 </script>
-
 </body>
 </html>
