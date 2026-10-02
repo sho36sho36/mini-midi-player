@@ -30,222 +30,127 @@ let audioCtx = null, mainGain = null, reverbNode = null, isPlaying = false, star
 const CLRS = ['#38bdf8', '#f43f5e', '#10b981', '#fbbf24', '#a855f7', '#ec4899', '#f97316', '#14b8a6'];
 
 let activeVoices = [];
-const MAX_VOICES = 128;
-let lastPlayTimes = {};
+const MAX_VOICES = 128; 
+let lastPlayTimes = {}; 
 
 function showLog(m) { logDiv.innerText = "ログ: " + m; }
 window.onerror = (m, s, l) => { showLog("エラー: " + m + " (L:" + l + ")"); return false; };
 
 function resize() {
-    cvs.width = window.innerWidth * window.devicePixelRatio;
-    cvs.height = window.innerHeight * window.devicePixelRatio;
-    ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
-    kyY = window.innerHeight - 100;
-    draw(0);
+    cvs.width = window.innerWidth * window.devicePixelRatio; cvs.height = window.innerHeight * window.devicePixelRatio;
+    ctx.scale(window.devicePixelRatio, window.devicePixelRatio); kyY = window.innerHeight - 100; draw(0);
 }
-
-window.addEventListener('resize', resize);
-resize();
+window.addEventListener('resize', resize); resize();
 
 function createReverbBuffer(ctx, duration, decay) {
     const rate = ctx.sampleRate, length = rate * duration, buffer = ctx.createBuffer(2, length, rate);
-
     for (let channel = 0; channel < 2; channel++) {
         const data = buffer.getChannelData(channel);
-
-        for (let i = 0; i < length; i++) {
-            data[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / length, decay);
-        }
+        for (let i = 0; i < length; i++) { data[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / length, decay); }
     }
-
     return buffer;
 }
 
 function initAudioEngine() {
     if (!audioCtx) {
         audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-
         mainGain = audioCtx.createGain();
-
+        
         reverbNode = audioCtx.createConvolver();
-        reverbNode.buffer = createReverbBuffer(audioCtx, 1.8, 2.0);
-
+        reverbNode.buffer = createReverbBuffer(audioCtx, 1.8, 2.0); 
+        
         const reverbGain = audioCtx.createGain();
-        reverbGain.gain.setValueAtTime(0.2, audioCtx.currentTime);
-
+        reverbGain.gain.setValueAtTime(0.2, audioCtx.currentTime); 
+        
         const compressor = audioCtx.createDynamicsCompressor();
-
-        compressor.threshold.setValueAtTime(-10, audioCtx.currentTime);
+        compressor.threshold.setValueAtTime(-10, audioCtx.currentTime); 
         compressor.knee.setValueAtTime(15, audioCtx.currentTime);
-        compressor.ratio.setValueAtTime(4, audioCtx.currentTime);
+        compressor.ratio.setValueAtTime(4, audioCtx.currentTime); 
         compressor.attack.setValueAtTime(0.002, audioCtx.currentTime);
         compressor.release.setValueAtTime(0.06, audioCtx.currentTime);
-
+        
         mainGain.connect(compressor);
         mainGain.connect(reverbNode);
         reverbNode.connect(reverbGain);
         reverbGain.connect(compressor);
         compressor.connect(audioCtx.destination);
     }
-
     if (audioCtx.state === 'suspended') audioCtx.resume();
 }
 
 function playTone(n, d, vel, ch, inst, tr, targetTime) {
     if (!audioCtx) return;
-
     const playTime = targetTime + startTime;
-
     if (playTime < audioCtx.currentTime) return;
 
     const noteKey = n + "_" + ch;
-
     if (lastPlayTimes[noteKey] && (targetTime - lastPlayTimes[noteKey] < 0.035)) {
-        return;
+        return; 
     }
-
     lastPlayTimes[noteKey] = targetTime;
 
     if (activeVoices.length >= MAX_VOICES) {
         const oldest = activeVoices.shift();
-
-        try {
-            oldest.osc.stop(playTime);
-            oldest.gain.gain.setValueAtTime(0, playTime);
-        } catch(e){}
+        try { oldest.osc.stop(playTime); oldest.gain.gain.setValueAtTime(0, playTime); } catch(e){}
     }
 
-    let trackWeight = 0.05;
-
-    if (tr <= 2) trackWeight = 0.16;
-
-    // ★ 低い音ほど少し音量を上げる
-    // C4(60)以上は変更なし
-    // 低くなるほど最大1.8倍
-    const lowBoost = n < 60 ? 1 + ((60 - n) / 24) * 0.8 : 1;
-
-    const vol = (vel / 127) * trackWeight * lowBoost;
+    let trackWeight = 0.05; 
+    if (tr <= 2) trackWeight = 0.16; 
+    const vol = (vel / 127) * trackWeight;
 
     // 10ch ドラム合成
     if (ch === 9) {
         const osc = audioCtx.createOscillator(), gain = audioCtx.createGain();
-
         osc.type = 'triangle';
-
-        osc.frequency.setValueAtTime(
-            n === 35 || n === 36 ? 85 : 7500,
-            playTime
-        );
-
-        if (n === 35 || n === 36) {
-            osc.frequency.exponentialRampToValueAtTime(0.01, playTime + 0.05);
-        }
-
+        osc.frequency.setValueAtTime(n === 35 || n === 36 ? 85 : 7500, playTime);
+        if (n === 35 || n === 36) osc.frequency.exponentialRampToValueAtTime(0.01, playTime + 0.05);
         gain.gain.setValueAtTime(vol * 1.2, playTime);
         gain.gain.exponentialRampToValueAtTime(0.001, playTime + 0.03);
-
-        osc.connect(gain);
-        gain.connect(mainGain);
-
-        osc.start(playTime);
-        osc.stop(playTime + 0.04);
-
-        activeVoices.push({
-            osc: osc,
-            gain: gain,
-            time: playTime
-        });
-
+        osc.connect(gain); gain.connect(mainGain);
+        osc.start(playTime); osc.stop(playTime + 0.04);
+        activeVoices.push({ osc: osc, gain: gain, time: playTime });
         return;
     }
 
     const osc = audioCtx.createOscillator();
     const gain = audioCtx.createGain();
-
     const freq = 440 * Math.pow(2, (n - 69) / 12);
-
     osc.frequency.setValueAtTime(freq, playTime);
 
     let isPiano = true;
-
-    if (inst >= 24 && inst <= 31) {
-        osc.type = 'triangle';
-        isPiano = false;
-
-    } else if ((inst >= 16 && inst <= 23) || (inst >= 40 && inst <= 51)) {
-        osc.type = 'sawtooth';
-        isPiano = false;
-
-    } else if (inst >= 56 && inst <= 79) {
-        osc.type = 'square';
-        isPiano = false;
-
-    } else {
-        osc.type = 'sine';
-
-        const attackMod = audioCtx.createOscillator();
-        const attackGain = audioCtx.createGain();
-
+    if (inst >= 24 && inst <= 31) { osc.type = 'triangle'; isPiano = false; } // ギター
+    else if ((inst >= 16 && inst <= 23) || (inst >= 40 && inst <= 51)) { osc.type = 'sawtooth'; isPiano = false; } // ストリングス
+    else if (inst >= 56 && inst <= 79) { osc.type = 'square'; isPiano = false; } // ブラス
+    else {
+        osc.type = 'sine'; // ピアノ・エレピ
+        const attackMod = audioCtx.createOscillator(), attackGain = audioCtx.createGain();
         attackMod.frequency.setValueAtTime(freq * 4, playTime);
-
         attackGain.gain.setValueAtTime(vol * 0.25, playTime);
         attackGain.gain.exponentialRampToValueAtTime(0.001, playTime + 0.015);
-
-        attackMod.connect(attackGain);
-        attackGain.connect(mainGain);
-
-        attackMod.start(playTime);
-        attackMod.stop(playTime + 0.02);
+        attackMod.connect(attackGain); attackGain.connect(mainGain);
+        attackMod.start(playTime); attackMod.stop(playTime + 0.02);
     }
 
     gain.gain.setValueAtTime(0, playTime);
-
-    gain.gain.linearRampToValueAtTime(
-        vol,
-        playTime + 0.003
-    );
+    gain.gain.linearRampToValueAtTime(vol, playTime + 0.003); // 立ち上がり
 
     if (isPiano) {
-        const sustainVolume = vol * 0.25;
-
-        gain.gain.exponentialRampToValueAtTime(
-            sustainVolume,
-            playTime + Math.min(d, 2.5)
-        );
-
-        gain.gain.setValueAtTime(
-            sustainVolume,
-            playTime + d
-        );
-
-        gain.gain.linearRampToValueAtTime(
-            0.0001,
-            playTime + d + 0.04
-        );
-
+        // ⚡【新実装】ピアノ独自の「だんだん音が小さくなる減衰（ディケイ）」を数式でシミュレート
+        // 鍵盤が押されている間、時間とともに音量が1/3以下に滑らかに落ちていき、離した瞬間（d秒後）に綺麗に消える
+        const sustainVolume = vol * 0.25; 
+        gain.gain.exponentialRampToValueAtTime(sustainVolume, playTime + Math.min(d, 2.5)); 
+        gain.gain.setValueAtTime(sustainVolume, playTime + d);
+        gain.gain.linearRampToValueAtTime(0.0001, playTime + d + 0.04); // 離した時のダンパーの消音
     } else {
-        gain.gain.setValueAtTime(
-            vol,
-            playTime + d - 0.005
-        );
-
-        gain.gain.linearRampToValueAtTime(
-            0.0001,
-            playTime + d
-        );
+        // ピアノ以外（ストリングスなど）は長さを維持
+        gain.gain.setValueAtTime(vol, playTime + d - 0.005);
+        gain.gain.linearRampToValueAtTime(0.0001, playTime + d);
     }
-
-    osc.connect(gain);
-    gain.connect(mainGain);
-
-    osc.start(playTime);
-    osc.stop(playTime + d + 0.05);
-
-    activeVoices.push({
-        osc: osc,
-        gain: gain,
-        time: playTime
-    });
+    
+    osc.connect(gain); gain.connect(mainGain);
+    osc.start(playTime); osc.stop(playTime + d + 0.05);
+    
+    activeVoices.push({ osc: osc, gain: gain, time: playTime });
 }
 
 function cleanVoices() {
@@ -255,58 +160,33 @@ function cleanVoices() {
 
 function readVLQ(v, o) {
     let val = 0, idx = 0;
-
-    while (true) {
-        let b = v.getUint8(o + idx);
-        idx++;
-        val = (val << 7) | (b & 127);
-
-        if (!(b & 128)) break;
-    }
-
+    while (true) { let b = v.getUint8(o + idx); idx++; val = (val << 7) | (b & 127); if (!(b & 128)) break; }
     return { val: val, idx: idx };
 }
-
 function parseMIDI(buf) {
-    const v = new DataView(buf);
-    let off = 0;
-
-    if (v.getUint32(0) !== 0x4D546864) {
-        throw new Error("無効なMIDIファイルです");
-    }
-
+    const v = new DataView(buf); let off = 0;
+    if (v.getUint32(0) !== 0x4D546864) throw new Error("無効なMIDIファイルです");
+    
     const hLen = v.getUint32(4);
     const tCnt = v.getUint16(10);
     const tDiv = v.getUint16(12);
-
-    if (tDiv & 0x8000) {
-        throw new Error("未対応の形式です");
-    }
-
+    if (tDiv & 0x8000) throw new Error("未対応の形式です");
+    
     let tempoEvents = [];
     let trackOffsets = [];
     let trackEnds = [];
-
+    
     off = 8 + hLen;
-
     for (let t = 0; t < tCnt; t++) {
         if (off >= v.byteLength) break;
-
-        if (v.getUint32(off) !== 0x4D54726B) {
-            off += 8 + v.getUint32(off + 4);
-            continue;
-        }
-
+        if (v.getUint32(off) !== 0x4D54726B) { off += 8 + v.getUint32(off + 4); continue; }
         const tLen = v.getUint32(off + 4);
-
         trackOffsets.push(off + 8);
         trackEnds.push(off + 8 + tLen);
-
         off += 8 + tLen;
     }
 
     let allNotesRaw = [];
-
     const skipTypes = "160_176_224";
     const sysTypes = "240_247";
 
@@ -319,93 +199,41 @@ function parseMIDI(buf) {
         let act = {};
 
         while (tOff < tEnd) {
-            let vlq = readVLQ(v, tOff);
-            tOff += vlq.idx;
-
+            let vlq = readVLQ(v, tOff); tOff += vlq.idx;
             currentTick += vlq.val;
 
-            let stat = v.getUint8(tOff);
-
-            if (stat & 128) {
-                rStat = stat;
-                tOff++;
-            } else {
-                stat = rStat;
-            }
-
-            let mType = stat & 240;
-            let ch = stat & 15;
+            let stat = v.getUint8(tOff); if (stat & 128) { rStat = stat; tOff++; } else { stat = rStat; }
+            let mType = stat & 240, ch = stat & 15;
 
             if (mType === 144 || mType === 128) {
-                let n = v.getUint8(tOff);
-                let vel = v.getUint8(tOff + 1);
-
-                tOff += 2;
-
+                let n = v.getUint8(tOff), vel = v.getUint8(tOff + 1); tOff += 2;
                 if (mType === 144 && vel > 0) {
-                    act[n] = {
-                        tick: currentTick,
-                        v: vel,
-                        i: inst,
-                        c: ch
-                    };
-
+                    act[n] = { tick: currentTick, v: vel, i: inst, c: ch };
                 } else if (act[n]) {
                     let durTick = currentTick - act[n].tick;
-
                     if (durTick > 0) {
                         allNotesRaw.push({
-                            m: n,
-                            startTick: act[n].tick,
-                            endTick: currentTick,
-                            v: act[n].v,
-                            i: act[n].i,
-                            ch: act[n].c,
-                            tr: t,
-                            p: false
+                            m: n, startTick: act[n].tick, endTick: currentTick, v: act[n].v, i: act[n].i, ch: act[n].c, tr: t, p: false
                         });
                     }
-
                     delete act[n];
                 }
-
             } else if (mType === 192) {
                 inst = v.getUint8(tOff++);
-
             } else if (skipTypes.indexOf(String(mType)) !== -1) {
                 tOff += 2;
-
             } else if (mType === 208) {
                 tOff += 1;
-
             } else if (stat === 255) {
-                let m2 = v.getUint8(tOff++);
-                let mV = readVLQ(v, tOff);
-
-                tOff += mV.idx;
-
+                let m2 = v.getUint8(tOff++); let mV = readVLQ(v, tOff); tOff += mV.idx;
                 if (m2 === 81) {
-                    let u1 = v.getUint8(tOff);
-                    let u2 = v.getUint8(tOff + 1);
-                    let u3 = v.getUint8(tOff + 2);
-
-                    let mpb =
-                        (u1 << 16) |
-                        (u2 << 8) |
-                        u3;
-
-                    tempoEvents.push({
-                        tick: currentTick,
-                        bpm: 60000000 / mpb
-                    });
+                    let u1 = v.getUint8(tOff), u2 = v.getUint8(tOff + 1), u3 = v.getUint8(tOff + 2);
+                    let mpb = (u1 << 16) | (u2 << 8) | u3;
+                    tempoEvents.push({ tick: currentTick, bpm: 60000000 / mpb });
                 }
-
                 tOff += mV.val;
-
             } else if (sysTypes.indexOf(String(stat)) !== -1) {
-                let sV = readVLQ(v, tOff);
-                tOff += sV.idx + sV.val;
-
+                let sV = readVLQ(v, tOff); tOff += sV.idx + sV.val;
             } else {
                 break;
             }
@@ -413,94 +241,54 @@ function parseMIDI(buf) {
     }
 
     tempoEvents.sort((a, b) => a.tick - b.tick);
-
     if (tempoEvents.length === 0 || tempoEvents.tick > 0) {
-        tempoEvents.unshift({
-            tick: 0,
-            bpm: 120
-        });
+        tempoEvents.unshift({ tick: 0, bpm: 120 });
     }
 
     function tickToSecond(tick) {
-        let sec = 0;
-        let curTick = 0;
-        let curBPM = 120;
-
+        let sec = 0, curTick = 0, curBPM = 120;
         for (let i = 0; i < tempoEvents.length; i++) {
             if (tick <= tempoEvents[i].tick) break;
-
-            let delta =
-                tempoEvents[i].tick -
-                curTick;
-
-            sec +=
-                delta *
-                (60 / (curBPM * tDiv));
-
+            let delta = tempoEvents[i].tick - curTick;
+            sec += delta * (60 / (curBPM * tDiv));
             curTick = tempoEvents[i].tick;
             curBPM = tempoEvents[i].bpm;
         }
-
-        sec +=
-            (tick - curTick) *
-            (60 / (curBPM * tDiv));
-
+        sec += (tick - curTick) * (60 / (curBPM * tDiv));
         return sec;
     }
 
     let finalNotes = [];
-
     for (let i = 0; i < allNotesRaw.length; i++) {
         let n = allNotesRaw[i];
-
         let tSec = tickToSecond(n.startTick);
         let eSec = tickToSecond(n.endTick);
-
         finalNotes.push({
-            m: n.m,
-            t: tSec,
-            d: eSec - tSec,
-            v: n.v,
-            i: n.i,
-            ch: n.ch,
-            tr: n.tr,
-            p: false
+            m: n.m, t: tSec, d: eSec - tSec, v: n.v, i: n.i, ch: n.ch, tr: n.tr, p: false
         });
     }
-
     return finalNotes;
 }
 
 fInp.addEventListener('change', async (e) => {
-    const fs = e.target.files;
-
-    if (!fs || fs.length === 0) return;
-
+    const fs = e.target.files; if (!fs || fs.length === 0) return;
     const file = fs.item(0);
-
     showLog("高速BlackMIDI解析中...: " + file.name);
-
+    
     initAudioEngine();
-
+    
     try {
         const buf = await file.arrayBuffer();
-
         notes = parseMIDI(buf);
         notes.sort((a, b) => a.t - b.t);
-
-        isPlaying = false;
-        pauseTime = 0;
-        lastPlayTimes = {};
-
-        pBtn.style.display = 'block';
-        pBtn.textContent = '▶ 再生';
-
+        
+        isPlaying = false; pauseTime = 0;
+        lastPlayTimes = {}; 
+        pBtn.style.display = 'block'; pBtn.textContent = '▶ 再生';
         showLog("読み込み成功! 総ノーツ数: " + notes.length);
-
+        
         notes.forEach(n => n.p = false);
-
         draw(0);
-
     } catch (err) {
         showLog("失敗: " + err.message);
     }
@@ -508,174 +296,88 @@ fInp.addEventListener('change', async (e) => {
 
 pBtn.addEventListener('click', () => {
     initAudioEngine();
-
     if (isPlaying) {
-        isPlaying = false;
-        pauseTime = audioCtx.currentTime - startTime;
-        pBtn.textContent = '▶ 再生';
-        showLog("一時停止");
-
+        isPlaying = false; pauseTime = audioCtx.currentTime - startTime; pBtn.textContent = '▶ 再生'; showLog("一時停止");
     } else {
-        isPlaying = true;
-        startTime = audioCtx.currentTime - pauseTime;
-        pBtn.textContent = '再生中...';
-        animate();
+        isPlaying = true; startTime = audioCtx.currentTime - pauseTime; pBtn.textContent = '再生中...'; animate();
     }
 });
 
 function animate() {
     if (!isPlaying) return;
-
     const cTime = audioCtx.currentTime - startTime;
     const lookAheadTime = cTime + 0.05;
-
+    
     notes.forEach(n => {
         if (!n.p && lookAheadTime >= n.t) {
-            playTone(
-                n.m,
-                n.d,
-                n.v,
-                n.ch,
-                n.i,
-                n.tr,
-                n.t
-            );
-
-            n.p = true;
+            playTone(n.m, n.d, n.v, n.ch, n.i, n.tr, n.t); n.p = true;
         }
     });
-
+    
     cleanVoices();
     draw(cTime);
-
     requestAnimationFrame(animate);
 }
 
 function draw(cTime) {
-    const w = window.innerWidth;
-    const h = window.innerHeight;
-    const kW = w / NOTE_CNT;
-    const act = new Set();
-    const actC = {};
-
-    ctx.fillStyle = '#000000';
-    ctx.fillRect(0, 0, w, h);
-
+    const w = window.innerWidth, h = window.innerHeight, kW = w / NOTE_CNT, act = new Set(), actC = {};
+    ctx.fillStyle = '#000000'; ctx.fillRect(0, 0, w, h);
+    
     const viewMinTime = cTime - 2;
     const viewMaxTime = cTime + (kyY / SPEED);
-
+    
+    // ⚡【新実装】描画のバッチ処理グループの初期化
     let colorPaths = {};
-
-    for (let cIdx = 0; cIdx < CLRS.length; cIdx++) {
-        colorPaths[CLRS[cIdx]] = [];
-    }
-
-    colorPaths['#555555'] = [];
-
-    let hitNotes = [];
-
+    for (let cIdx = 0; cIdx < CLRS.length; cIdx++) { colorPaths[CLRS[cIdx]] = []; }
+    colorPaths['#555555'] = []; // ドラム用
+    let hitNotes = []; // ヒット中の光る白ノーツ用
+    
     notes.forEach(n => {
         if (n.m < MIN_NOTE || n.m > MAX_NOTE) return;
         if (n.t + n.d < viewMinTime || n.t > viewMaxTime) return;
-
-        const x = (n.m - MIN_NOTE) * kW;
-        const y = kyY - (n.t - cTime) * SPEED;
-        const nH = n.d * SPEED;
-
-        const c =
-            (n.ch === 9)
-                ? '#555555'
-                : CLRS[n.tr % CLRS.length];
-
+        
+        const x = (n.m - MIN_NOTE) * kW, y = kyY - (n.t - cTime) * SPEED, nH = n.d * SPEED;
+        const c = (n.ch === 9) ? '#555555' : CLRS[n.tr % CLRS.length];
+        
         if (cTime >= n.t && cTime <= n.t + n.d) {
-            act.add(n.m);
-            actC[n.m] = c;
-
-            hitNotes.push({
-                x: x + 1,
-                y: y - nH,
-                w: kW - 2,
-                h: nH
-            });
-
+            act.add(n.m); actC[n.m] = c;
+            hitNotes.push({x: x + 1, y: y - nH, w: kW - 2, h: nH});
         } else {
-            colorPaths[c].push({
-                x: x + 1,
-                y: y - nH,
-                w: kW - 2,
-                h: nH
-            });
+            // 色ごとの座標配列へプール
+            colorPaths[c].push({x: x + 1, y: y - nH, w: kW - 2, h: nH});
         }
     });
-
+    
+    // ⚡【高速化の核心】色ごとに1回だけパスをまとめて一括塗りつぶし（数万回 ➔ 数回へ削減）
     Object.keys(colorPaths).forEach(color => {
         const arr = colorPaths[color];
-
         if (arr.length === 0) return;
-
         ctx.fillStyle = color;
         ctx.beginPath();
-
         for (let i = 0; i < arr.length; i++) {
-            ctx.rect(
-                arr[i].x,
-                arr[i].y,
-                arr[i].w,
-                arr[i].h
-            );
+            ctx.rect(arr[i].x, arr[i].y, arr[i].w, arr[i].h);
         }
-
         ctx.fill();
     });
-
+    
+    // 光る白ノーツを一括描画
     if (hitNotes.length > 0) {
         ctx.fillStyle = '#ffffff';
         ctx.beginPath();
-
         for (let i = 0; i < hitNotes.length; i++) {
-            ctx.rect(
-                hitNotes[i].x,
-                hitNotes[i].y,
-                hitNotes[i].w,
-                hitNotes[i].h
-            );
+            ctx.rect(hitNotes[i].x, hitNotes[i].y, hitNotes[i].w, hitNotes[i].h);
         }
-
         ctx.fill();
     }
-
+    
     // 鍵盤の描画
     for (let i = 0; i < NOTE_CNT; i++) {
-        const nId = MIN_NOTE + i;
-        const x = i * kW;
-        const rem = nId % 12;
-
-        const isS =
-            (rem === 1 ||
-             rem === 3 ||
-             rem === 6 ||
-             rem === 8 ||
-             rem === 10);
-
-        ctx.fillStyle =
-            act.has(nId)
-                ? actC[nId]
-                : (isS ? '#151515' : '#ffffff');
-
-        ctx.fillRect(
-            x,
-            kyY,
-            kW - 1,
-            h - kyY
-        );
+        const nId = MIN_NOTE + i, x = i * kW, rem = nId % 12;
+        const isS = (rem===1||rem===3||rem===6||rem===8||rem===10);
+        ctx.fillStyle = act.has(nId) ? actC[nId] : (isS ? '#151515' : '#ffffff');
+        ctx.fillRect(x, kyY, kW - 1, h - kyY);
     }
-
-    ctx.strokeStyle = '#ff0055';
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.moveTo(0, kyY);
-    ctx.lineTo(w, kyY);
-    ctx.stroke();
+    ctx.strokeStyle = '#ff0055'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(0, kyY); ctx.lineTo(w, kyY); ctx.stroke();
 }
 </script>
 </body>
