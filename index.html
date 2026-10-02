@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
+    <title>超軽量 BlackMIDI Player</title>
+    <style>
+        body{margin:0;background:#000;color:#fff;font-family:sans-serif;overflow:hidden;position:fixed;width:100%;height:100%;}
+        #ctl{position:absolute;top:10px;left:10px;z-index:10;display:flex;gap:10px;}
+        input[type="file"]{display:none;}
+        .btn{background:#2563eb;color:#fff;padding:8px 16px;border-radius:20px;font-size:14px;font-weight:bold;border:none;cursor:pointer;}
+        canvas{display:block;width:100vw;height:100vh;}
+        #log{position:absolute;bottom:110px;left:10px;right:10px;background:rgba(0,0,0,0.8);color:#00ff00;font-family:monospace;font-size:11px;padding:6px;max-height:50px;z-index:20;pointer-events:none;border-radius:4px;}
+    </style>
+</head>
+<body>
+    <div id="ctl">
+        <label class="btn" for="fInp">📁 MIDIを開く</label>
+        <input type="file" id="fInp" accept=".mid,.midi">
+        <button class="btn" id="pBtn" style="display:none;">▶ 再生</button>
+    </div>
+    <div id="log">ログ: BlackMIDI対応。ファイルを選択してください。</div>
+    <canvas id="cvs"></canvas>
+
+<script>
+const cvs = document.getElementById('cvs'), ctx = cvs.getContext('2d');
+const fInp = document.getElementById('fInp'), pBtn = document.getElementById('pBtn'), logDiv = document.getElementById('log');
+const MIN_NOTE = 36, MAX_NOTE = 96, NOTE_CNT = MAX_NOTE - MIN_NOTE + 1, SPEED = 250;
+let audioCtx = null, mainGain = null, reverbNode = null, isPlaying = false, startTime = 0, pauseTime = 0, notes = [], kyY = 0;
+const CLRS = ['#38bdf8', '#f43f5e', '#10b981', '#fbbf24', '#a855f7', '#ec4899', '#f97316', '#14b8a6'];
+
+let activeVoices = [];
+const MAX_VOICES = 128; 
+let lastPlayTimes = {}; 
+
+function showLog(m) { logDiv.innerText = "ログ: " + m; }
+window.onerror = (m, s, l) => { showLog("エラー: " + m + " (L:" + l + ")"); return false; };
+
+function resize() {
+    cvs.width = window.innerWidth * window.devicePixelRatio; cvs.height = window.innerHeight * window.devicePixelRatio;
+    ctx.scale(window.devicePixelRatio, window.devicePixelRatio); kyY = window.innerHeight - 100; draw(0);
+}
+window.addEventListener('resize', resize); resize();
+
+function createReverbBuffer(ctx, duration, decay) {
+    const rate = ctx.sampleRate, length = rate * duration, buffer = ctx.createBuffer(2, length, rate);
+    for (let channel = 0; channel < 2; channel++) {
+        const data = buffer.getChannelData(channel);
+        for (let i = 0; i < length; i++) { data[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / length, decay); }
+    }
+    return buffer;
+}
+
+function initAudioEngine() {
+    if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        mainGain = audioCtx.createGain();
+        
+        reverbNode = audioCtx.createConvolver();
+        reverbNode.buffer = createReverbBuffer(audioCtx, 1.8, 2.0); 
+        
+        const reverbGain = audioCtx.createGain();
+        reverbGain.gain.setValueAtTime(0.2, audioCtx.currentTime); 
+        
+        const compressor = audioCtx.createDynamicsCompressor();
+        compressor.threshold.setValueAtTime(-10, audioCtx.currentTime); 
+        compressor.knee.setValueAtTime(15, audioCtx.currentTime);
+        compressor.ratio.setValueAtTime(4, audioCtx.currentTime); 
+        compressor.attack.setValueAtTime(0.002, audioCtx.currentTime);
+        compressor.release.setValueAtTime(0.06, audioCtx.currentTime);
+        
+        mainGain.connect(compressor);
+        mainGain.connect(reverbNode);
+        reverbNode.connect(reverbGain);
+        reverbGain.connect(compressor);
+        compressor.connect(audioCtx.destination);
+    }
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+}
+
+function playTone(n, d, vel, ch, inst, tr, targetTime) {
+    if (!audioCtx) return;
+    const playTime = targetTime + startTime;
+    if (playTime < audioCtx.currentTime) return;
+
+    const noteKey = n + "_" + ch;
+    if (lastPlayTimes[noteKey] && (targetTime - lastPlayTimes[noteKey] < 0.035)) {
+        return; 
+    }
+    lastPlayTimes[noteKey] = targetTime;
+
+    if (activeVoices.length >= MAX_VOICES) {
+        const oldest = activeVoices.shift();
+        try { oldest.osc.stop(playTime); oldest.gain.gain.setValueAtTime(0, playTime); } catch(e){}
+    }
+
+    let trackWeight = 0.05; 
+    if (tr <= 2) trackWeight = 0.16; 
+    const vol = (vel / 127) * trackWeight;
+
+    // 低音ブースト処理（ノート番号60未満の音量を底上げ）
+    const boostedVol = n < 60 ? vol * (1.0 + (60 - n) * 0.03) : vol;
+
+    // 10ch ドラム合成
+    if (ch === 9) {
+        const osc = audioCtx.createOscillator(), gain = audioCtx.createGain();
+        osc.type = 'triangle';
+        osc.frequency.setValueAtTime(n === 35 || n === 36 ? 85 : 7500, playTime);
+        if (n === 35 || n === 36) osc.frequency.exponentialRampToValueAtTime(0.01, playTime + 0.05);
+        gain.gain.setValueAtTime(boostedVol * 1.2, playTime); 
+        gain.gain.exponentialRampToValueAtTime(0.001, playTime + 0.03);
+        osc.connect(gain); gain.connect(mainGain);
+        osc.start(playTime); osc.stop(playTime + 0.04);
+        activeVoices.push({ osc: osc, gain: gain, time: playTime });
+        return;
+    }
+
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    const freq = 440 * Math.pow(2, (n - 69) / 12);
+    osc.frequency.setValueAtTime(freq, playTime);
+
+    let isPiano = true;
+    if (inst >= 24 && inst <= 31) { osc.type = 'triangle'; isPiano = false; } 
+    else if ((inst >= 16 && inst <= 23) || (inst >= 40 && inst <= 51)) { osc.type = 'sawtooth'; isPiano = false; } 
+    else if (inst >= 56 && inst <= 79) { osc.type = 'square'; isPiano = false; } 
+    else {
+        osc.type = 'sine'; 
+        const attackMod = audioCtx.createOscillator(), attackGain = audioCtx.createGain();
+        attackMod.frequency.setValueAtTime(freq * 4, playTime);
+        attackGain.gain.setValueAtTime(boostedVol * 0.25, playTime); 
+        attackGain.gain.exponentialRampToValueAtTime(0.001, playTime + 0.015);
+        attackMod.connect(attackGain); attackGain.connect(mainGain);
+        attackMod.start(playTime); attackMod.stop(playTime + 0.02);
+    }
+
+    gain.gain.setValueAtTime(0, playTime);
+    gain.gain.linearRampToValueAtTime(boostedVol, playTime + 0.003); 
+
+    if (isPiano) {
+        const sustainVolume = boostedVol * 0.25; 
+        gain.gain.exponentialRampToValueAtTime(sustainVolume, playTime + Math.min(d, 2.5)); 
+        gain.gain.setValueAtTime(sustainVolume, playTime + d);
+        gain.gain.linearRampToValueAtTime(0.0001, playTime + d + 0.04); 
+    } else {
+        gain.gain.setValueAtTime(boostedVol, playTime + d - 0.005); 
+        gain.gain.linearRampToValueAtTime(0.0001, playTime + d);
+    }
+    
+    osc.connect(gain); gain.connect(mainGain);
+    osc.start(playTime); osc.stop(playTime + d + 0.05);
+    
+    activeVoices.push({ osc: osc, gain: gain, time: playTime });
+}
+
+function cleanVoices() {
+    const now = audioCtx ? audioCtx.currentTime : 0;
+    activeVoices = activeVoices.filter(v => now < v.time + 0.4);
+}
+
+function readVLQ(v, o) {
+    let val = 0, idx = 0;
+    while (true) { let b = v.getUint8(o + idx); idx++; val = (val << 7) | (b & 127); if (!(b & 128)) break; }
+    return { val: val, idx: idx };
+}
+function parseMIDI(buf) {
+    const v = new DataView(buf); let off = 0;
+    if (v.getUint32(0) !== 0x4D546864) throw new Error("無効なMIDIファイルです");
+    
+    const hLen = v.getUint32(4);
+    const tCnt = v.getUint16(10);
+    const tDiv = v.getUint16(12);
+    if (tDiv & 0x8000) throw new Error("未対応の形式です");
+    
+    let trackOffsets = [];
+    let trackEnds = [];
+    
+    off = 8 + hLen;
+    for (let t = 0; t < tCnt; t++) {
+        if (off >= v.byteLength) break;
+        if (v.getUint32(off) !== 0x4D54726B) { off += 8 + v.getUint32(off + 4); continue; }
+        const tLen = v.getUint32(off + 4);
+        trackOffsets.push(off + 8);
+        trackEnds.push(off + 8 + tLen);
+        off += 8 + tLen;
+    }
+
+    notes = [];
+    let currentTempo = 500000; 
+    
+    for (let i = 0; i < trackOffsets.length; i++) {
+        let curOff = trackOffsets[i];
+        let endOff = trackEnds[i];
+        let curTick = 0;
+        let activeNotes = new Array(128).fill(null);
+        let currentInst = new Array(16).fill(0);
+        let lastStatus = 0;
+
+        while (curOff < endOff) {
+            let delta = readVLQ(v, curOff);
+            curTick += delta.val;
+            curOff += delta.idx;
+
+            let status = v.getUint8(curOff);
+            if (status < 0x80) {
+                status = lastStatus;
+            } else {
+                curOff++;
+                lastStatus = status;
+            }
+
+            let msgType = status & 0xF0;
+            let ch = status & 0x0F;
+
+            if (msgType === 0x90 || msgType === 0x80) {
+                let noteNum = v.getUint8(curOff++);
+                let velocity = v.getUint8(curOff++);
+                let secTime = curTick * (currentTempo / 1000000) / tDiv;
+
+                if (msgType === 0x90 && velocity > 0) {
+                    activeNotes[noteNum] = { start: secTime, vel: velocity, inst: currentInst[ch], track: i, ch: ch };
+                } else if (activeNotes[noteNum]) {
+                    let nObj = activeNotes[noteNum];
+                    notes.push({
+                        n: noteNum,
+                        t: nObj.start,
+                        d: Math.max(0.01, secTime - nObj.start),
+                        v: nObj.vel,
+                        ch: nObj.ch,
+                        inst: nObj.inst,
+                        tr: nObj.track
+                    });
+                    activeNotes[noteNum] = null;
+                }
+            } else if (msgType === 0xC0) {
+                currentInst[ch] = v.getUint8(curOff++);
+            } else if (msgType === 0xA0 || msgType === 0xB0 || msgType === 0xE0) {
+                curOff += 2;
+            } else if (status === 0xFF) {
+                let metaType = v.getUint8(curOff++);
+                let metaLen = readVLQ(v, curOff);
+                curOff += metaLen.idx;
+                if (metaType === 0x51) { 
+                    currentTempo = (v.getUint8(curOff) << 16) | (v.getUint8(curOff + 1) << 8) | v.getUint8(curOff + 2);
+                }
+                curOff += metaLen.val;
+            } else if (status === 0xF0 || status === 0xF7) {
+                let sysexLen = readVLQ(v, curOff);
+                curOff += sysexLen.idx + sysexLen.val;
+            }
+        }
+    }
+    notes.sort((a, b) => a.t - b.t);
+    showLog(`読み込み完了: ${notes.length} 音符`);
+    pBtn.style.display = 'inline-block';
+}
+
+let animId = null;
+function draw(nowTime) {
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, cvs.width, cvs.height);
+
+    ctx.fillStyle = '#222';
+    ctx.fillRect(0, kyY, cvs.width, 100);
+
+    const w = cvs.width / NOTE_CNT;
+    for (let i = 0; i < notes.length; i++) {
+        let n = notes[i];
+        if (n.t + n.d < nowTime) continue;
+        if (n.t > nowTime + 3) break;
+
+        let x = (n.n - MIN_NOTE) * w;
+        let y = kyY - (n.t - nowTime) * SPEED;
+        let h = n.d * SPEED;
+
+        ctx.fillStyle = CLRS[n.ch % CLRS.length];
+        ctx.fillRect(x, y - h, w - 1, h);
+
+        if (nowTime >= n.t && nowTime <= n.t + n.d) {
+            ctx.fillStyle = '#fff';
+            ctx.fillRect(x, kyY, w - 1, 10);
+        }
+    }
+}
+
+let playIdx = 0;
+function tick() {
+    if (!isPlaying) return;
+    let nowTime = audioCtx.currentTime - startTime;
+
+    while (playIdx < notes.length && notes[playIdx].t <= nowTime + 0.1) {
+        let n = notes[playIdx];
+        playTone(n.n, n.d, n.v, n.ch, n.inst, n.tr, n.t);
+        playIdx++;
+    }
+
+    cleanVoices();
+    draw(nowTime);
+    animId = requestAnimationFrame(tick);
+}
+
+fInp.addEventListener('change', (e) => {
+    let files = e.target.files;
+    if (!files || files.length === 0) return;
+    let file = files[0]; // 🛠️ parameter 1 is not of type 'Blob' エラーを修正
+    let reader = new FileReader();
+    reader.onload = (ev) => {
+        try {
+            parseMIDI(ev.target.result);
+        } catch (err) {
+            showLog(err.message);
+        }
+    };
+    reader.readAsArrayBuffer(file);
+});
+
+pBtn.addEventListener('click', () => {
+    initAudioEngine();
+    if (isPlaying) {
+        isPlaying = false;
+        pauseTime = audioCtx.currentTime - startTime;
+        pBtn.innerText = '▶ 再生';
+        cancelAnimationFrame(animId);
+    } else {
+        isPlaying = true;
+        startTime = audioCtx.currentTime - pauseTime;
+        pBtn.innerText = '⏸ 一時停止';
+        tick();
+    }
+});
+</script>
+</body>
+</html>
